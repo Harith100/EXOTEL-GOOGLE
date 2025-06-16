@@ -104,9 +104,8 @@ def media_handler(ws):
             try:
                 data = json.loads(message)
                 event_type = data.get('event')
-                
-                logger.info(f"Received event: {event_type}")
-                
+                # logger.info(f"Received event: {event_type}")
+
                 if event_type == 'connected':
                     handle_connected(connection_id, data)
                     
@@ -161,34 +160,44 @@ def handle_media(connection_id, data):
         logger.info(f"[{connection_id}] Media received — Chunk: {chunk_id}, Timestamp: {timestamp}, Payload length: {len(payload_b64)}")
 
         if not payload_b64:
-            logger.warning(f"[{connection_id}] Empty payload received")
             return
 
-        # Base64 decode
-        try:
-            pcm_data = base64.b64decode(payload_b64)
-            logger.debug(f"[{connection_id}] PCM decoded — Length: {len(pcm_data)} bytes")
-        except Exception as e:
-            logger.exception(f"[{connection_id}] Base64 decode failed")
-            return
-
-        # Append to buffer
+        # Decode audio from base64
+        pcm_data = base64.b64decode(payload_b64)
         conn['audio_buffer'] += pcm_data
-        logger.debug(f"[{connection_id}] Buffer size after append: {len(conn['audio_buffer'])} bytes")
 
-        # Optional: Save raw PCM for playback
+        # --- SILENCE DETECTION START ---
+        silence_threshold = 500  # Experimentally adjust if needed
+        silent = True
+        for i in range(0, len(pcm_data), 2):
+            sample = int.from_bytes(pcm_data[i:i+2], byteorder='little', signed=True)
+            if abs(sample) > silence_threshold:
+                silent = False
+                break
+
+        now = time.time()
+        conn.setdefault('last_voice_ts', now)
+        conn.setdefault('silence_start_ts', None)
+
+        if silent:
+            if conn['silence_start_ts'] is None:
+                conn['silence_start_ts'] = now
+            elif now - conn['silence_start_ts'] >= 2.0:
+                logger.info(f"[{connection_id}] Detected 2s silence — triggering STT")
+                process_audio_chunk(connection_id)
+                conn['silence_start_ts'] = None
+        else:
+            conn['silence_start_ts'] = None
+            conn['last_voice_ts'] = now
+        # --- SILENCE DETECTION END ---
+
+        # Optional: Save raw audio for debugging
         with open(f"debug_raw_{connection_id}.pcm", "ab") as f:
             f.write(pcm_data)
 
-        # Optional: Save to WAV every 2 seconds (or when needed)
-        if len(conn['audio_buffer']) >= 32000:
-            wav_path = f"debug_audio_{connection_id}.wav"
-            save_pcm_as_wav(conn['audio_buffer'], wav_path)
-            logger.info(f"[{connection_id}] Saved WAV file for STT: {wav_path}")
-            conn['audio_buffer'] = b''
-
     except Exception as e:
         logger.exception(f"[{connection_id}] Error in handle_media")
+
 
 def save_pcm_as_wav(pcm_data, path, sample_rate=8000):
     """Helper to save raw PCM to WAV"""
