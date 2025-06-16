@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: malayalam-voice-ai
+    env: python
+    plan: free
+    region: singapore  # or 'oregon' for better latency in India
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --worker-class eventlet -w 1 -b 0.0.0.0:10000
+    envVars:
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        value: <your-google-credentials-json-string>
