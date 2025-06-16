@@ -1,1 +1,1 @@
-web: gunicorn app:app --bind 0.0.0.0:$PORT --worker-class gevent --workers 1 --timeout 120
+web: gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:$PORT app:app

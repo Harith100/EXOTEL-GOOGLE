@@ -1,14 +1,14 @@
 import requests
 import json
 import logging
-import os
+import os 
 from typing import Optional, List, Dict
 
 logger = logging.getLogger(__name__)
 
 class GeminiClient:
     def __init__(self):
-        self.api_key = os.environ.get('GEMINI_API_KEY') 
+        self.api_key = os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY environment variable is required")
         
