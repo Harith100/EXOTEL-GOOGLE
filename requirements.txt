@@ -10,3 +10,4 @@ python-dotenv==1.0.0
 numpy
 scipy
 soundfile
+gevent>=1.4
