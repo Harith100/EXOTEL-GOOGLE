@@ -1,195 +1,97 @@
-import requests
+import asyncio
+import websockets
 import base64
 import json
-import logging
-import os
-from typing import Optional, Union
-import io
 import wave
-import tempfile
-from utils import AudioUtils  # Ensure this import is available
+import io
+import logging
+import signal
+import sys
 
-audio_utils = AudioUtils()  # Instantiate once globally if needed
+# Sarvam STT config
+SARVAM_STT_WS = "wss://api.sarvam.ai/speech-to-text/ws?language-code=ml-IN&model=saarika:v2.5"
+SAMPLE_RATE = 8000  # Hz
 
-logger = logging.getLogger(__name__)
+# Configure logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("SarvamSTTClient")
 
-class SarvamClient:
-    def __init__(self):
-        self.api_key = os.getenv("SARVAM_API_KEY")
-        if not self.api_key:
-            raise ValueError("SARVAM_API_KEY environment variable is required")
-            logger.error("SARVAM_API_KEY not set")  
-        
-        self.base_url = "https://api.sarvam.ai"
-        self.headers = {
-            "api-subscription-key": self.api_key,
-            "Content-Type": "application/json"
+# Graceful shutdown
+shutdown_event = asyncio.Event()
+
+
+def pcm_to_base64_wav(pcm_data: bytes, sample_rate: int = 8000) -> str:
+    """Convert PCM bytes to base64-encoded WAV format"""
+    with io.BytesIO() as wav_io:
+        with wave.open(wav_io, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)  # 16-bit PCM
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm_data)
+        wav_bytes = wav_io.getvalue()
+    return base64.b64encode(wav_bytes).decode('utf-8')
+
+
+async def send_audio(ws, audio_bytes):
+    """Send audio chunk as base64 WAV"""
+    b64_data = pcm_to_base64_wav(audio_bytes, SAMPLE_RATE)
+    payload = {
+        "audio": {
+            "data": b64_data,
+            "encoding": "audio/wav",
+            "sample_rate": str(SAMPLE_RATE)
         }
-        
-        # STT endpoint
-        self.stt_url = f"{self.base_url}/speech-to-text"
-        # TTS endpoint  
-        self.tts_url = f"{self.base_url}/text-to-speech"
-        
-    
-    
-    
-    def text_to_speech(self, text: str, voice: str = "meera") -> Optional[bytes]:
-        """
-        Convert text to speech using Sarvam TTS API and convert to Exotel-compatible PCM
-        
-        Args:
-            text: Malayalam text to convert
-            voice: Voice model to use
-            
-        Returns:
-            PCM audio bytes (8kHz, 16-bit, mono) or None if error
-        """
+    }
+    await ws.send(json.dumps(payload))
+    logger.info(f"Sent {len(audio_bytes)} bytes of audio.")
+
+
+async def receive_transcription(ws):
+    """Receive transcription results"""
+    async for message in ws:
         try:
-            if not text or not text.strip():
-                logger.warning("Empty text provided to TTS")
-                return None
-            
-            # Prepare request payload
-            payload = {
-                "inputs": [text.strip()],
-                "target_language_code": "ml-IN",  # Malayalam
-                "speaker": voice,
-                "pitch": 0,
-                "pace": 1.0,
-                "loudness": 1.0,
-                "speech_sample_rate": 8000,  # Match Exotel format
-                "enable_preprocessing": True,
-                "model": "bulbul:v1"
-            }
-            
-            # Make API request
-            response = requests.post(
-                self.tts_url,
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-
-            
-            if response.status_code == 200:
-                result = response.json()
-                logger.info(f"TTS response: {result}")
-                if 'audios' in result and len(result['audios']) > 0:
-                    audio_base64 = result['audios'][0]
-                    wav_audio_bytes = base64.b64decode(audio_base64)
-
-                    logger.info(f"TTS successful, audio length (WAV): {len(wav_audio_bytes)} bytes")
-                    
-                    # Convert to PCM 8kHz mono for Exotel
-                    pcm_audio_bytes = audio_utils.process_audio_for_playback(wav_audio_bytes)
-
-                    logger.info(f"Converted to PCM, length: {len(pcm_audio_bytes)} bytes")
-                    return pcm_audio_bytes
-                else:
-                    logger.error("No audio data in TTS response")
-                    return None
+            response = json.loads(message)
+            if "transcript" in response:
+                logger.info("📝 Transcript: %s", response["transcript"])
             else:
-                logger.error(f"TTS API error: {response.status_code} - {response.text}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            logger.error("TTS API timeout")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"TTS API request error: {str(e)}")
-            return None
+                logger.debug("Received message: %s", response)
         except Exception as e:
-            logger.error(f"TTS processing error: {str(e)}")
-            return None
-    
-    def get_available_voices(self) -> list:
-        """
-        Get list of available Malayalam voices
-        
-        Returns:
-            List of available voice names
-        """
-        try:
-            # This endpoint may not exist in Sarvam API
-            # Return default voices for now
-            return ["meera", "ravi", "arjun"]
-            
-        except Exception as e:
-            logger.error(f"Error getting voices: {str(e)}")
-            return ["meera"]  # fallback
-    
-    def test_connection(self) -> bool:
-        """
-        Test API connection
-        
-        Returns:
-            True if connection successful
-        """
-        try:
-            # Test with a simple TTS request
-            test_text = "പരീക്ഷണം"  # "Test" in Malayalam
-            result = self.text_to_speech(test_text)
-            if result is None:
-                logger.error("Connection test failed: No audio returned")
-            return result is not None
-            
-        except Exception as e:
-            logger.error(f"Connection test failed: {str(e)}")
-            return False
-        
-    def speech_to_text(self, audio_data: bytes, final: bool = False) -> Optional[str]:
-    
+            logger.error("Error decoding message: %s", e)
 
-        try:
-            # Write PCM bytes to a WAV file using tempfile
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-                with wave.open(temp_wav.name, 'wb') as wf:
-                    logger.info(f"Writing audio data to temporary WAV file: {temp_wav.name}")
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)  # 16-bit PCM = 2 bytes
-                    wf.setframerate(8000)
-                    wf.writeframes(audio_data)
 
-                temp_wav.seek(0)
-                files = {
-                    "file": ("audio.wav", open(temp_wav.name, "rb"), "audio/wav")
-                }
+async def stt_main():
+    async with websockets.connect(SARVAM_STT_WS) as ws:
+        logger.info("Connected to Sarvam STT WebSocket.")
 
-                data = {
-                    "model": "saarika:v2.5",
-                    "language_code": "ml-IN",
-                    "format": "wav",
-                    "sample_rate": "8000",
-                    "encoding": "linear16",
-                    "with_timestamps": "false",
-                    "enable_speaker_diarization": "false"
-                }
+        # Simulated audio source (replace with real Exotel PCM buffer)
+        async def audio_streamer():
+            with open("sample_8khz_pcm.raw", "rb") as f:  # Raw PCM file
+                while not shutdown_event.is_set():
+                    chunk = f.read(1600)  # 100ms @ 8kHz 16-bit mono = 1600 bytes
+                    if not chunk:
+                        break
+                    await send_audio(ws, chunk)
+                    await asyncio.sleep(0.1)
 
-                headers = {
-                    "api-subscription-key": self.api_key
-                }
+        await asyncio.gather(audio_streamer(), receive_transcription(ws))
 
-                response = requests.post(
-                    self.stt_url,
-                    headers=headers,
-                    data=data,
-                    files=files,
-                    timeout=30
-                )
 
-            if response.status_code == 200:
-                logger.info("STT processing successful")
-                result = response.json()
-                logger.info(f"STT response: {result}")
-                transcript = result.get('transcript', '').strip()
-                if not transcript:
-                    logger.warning("STT returned empty transcript")
-                return transcript if transcript else None
-            else:
-                logger.error(f"STT API error: {response.status_code} - {response.text}")
-                return None
+def main():
+    loop = asyncio.get_event_loop()
 
-        except Exception as e:
-            logger.error(f"STT processing error: {str(e)}")
-            return None
+    def shutdown_handler(*_):
+        logger.info("Shutdown signal received.")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    try:
+        loop.run_until_complete(stt_main())
+    finally:
+        logger.info("Client shutdown complete.")
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

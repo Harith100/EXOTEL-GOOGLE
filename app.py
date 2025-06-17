@@ -13,6 +13,9 @@ import socket
 import wave
 import struct
 import time
+import tempfile
+import io
+import requests
 
 
 # Configure logging
@@ -204,13 +207,17 @@ def handle_media(connection_id, data):
         logger.exception(f"[{connection_id}] Error in handle_media")
 
 
-def save_pcm_as_wav(pcm_data, path, sample_rate=8000):
-    """Helper to save raw PCM to WAV"""
-    with wave.open(path, 'wb') as wf:
+#def save_pcm_as_wav(pcm_data, path, sample_rate=8000):
+def save_pcm_as_wav(pcm_data: bytes, sample_rate: int = 8000) -> str:
+    """Convert raw PCM bytes to base64 WAV string (in-memory)."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)
+        wf.setsampwidth(2)  # 16-bit PCM = 2 bytes
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_data)
+    wav_bytes = buffer.getvalue()
+    return base64.b64encode(wav_bytes).decode('utf-8')
 
 def handle_stop(connection_id, data):
     """Handle stream stop event"""
@@ -221,55 +228,70 @@ def handle_stop(connection_id, data):
         if active_connections[connection_id]['audio_buffer']:
             process_audio_chunk(connection_id, final=True)
 
-def process_audio_chunk(connection_id, final=False):
-    """Process accumulated audio buffer"""
-    if connection_id not in active_connections:
-        logger.warning(f"No active connection for ID: {connection_id}")
+def process_audio_chunk(connection_id):
+    conn = active_connections.get(connection_id)
+    if not conn:
+        logger.warning(f"No connection found for ID: {connection_id}")
         return
-        
-    connection = active_connections[connection_id]
-    audio_buffer = connection['audio_buffer']
-    
-    if not audio_buffer:
-        return
-        
-    try:
-        # Ensure chunk size is multiple of 320 (frame size for 8kHz)
-        chunk_size = (len(audio_buffer) // 320) * 320
-        if chunk_size == 0:
-            return
-            
-        audio_chunk = audio_buffer[:chunk_size]
-        logger.info(f"Processing audio chunk for connection {connection_id}, size: {len(audio_chunk)} bytes")
-        connection['audio_buffer'] = audio_buffer[chunk_size:]
-        
-        # Convert audio format for Sarvam (PCM 8kHz to required format)
-        processed_audio = audio_utils.process_audio_for_stt(audio_chunk)
-        logger.info(f"Processing audio chunk for connection {connection_id}, size: {len(processed_audio)} bytes")
-        
-        # Send to STT in separate thread to avoid blocking
-        Thread(target=process_stt, args=(connection_id, processed_audio, final)).start()
-        
-    except Exception as e:
-        logger.error(f"Error processing audio chunk: {str(e)}")
 
-def process_stt(connection_id, audio_data, final=False):
-    """Process Speech-to-Text"""
+    pcm_data = conn.get("audio_buffer", b"")
+    if not pcm_data:
+        logger.info(f"[{connection_id}] No audio data to process.")
+        return
+
     try:
-        # Send audio to Sarvam STT
-        transcript = sarvam_client.speech_to_text(audio_data, final=final)
-        if transcript is None:
-            logger.error(f"STT returned None for connection {connection_id}")
-            return
-        
-        if transcript and transcript.strip():
-            logger.info(f"Transcript: {transcript}")
-            
-            # Send to Gemini for response
-            Thread(target=process_gemini_response, args=(connection_id, transcript)).start()
-            
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+            path = tmp_wav.name
+            save_pcm_as_wav(pcm_data, path)
+            logger.info(f"[{connection_id}] Saved audio to WAV: {path}")
+
+            # Example STT usage
+            transcription = sarvam_client.speech_to_text(path)
+            logger.info(f"[{connection_id}] Transcription: {transcription}")
+
     except Exception as e:
-        logger.error(f"STT error: {str(e)}")
+        logger.exception(f"[{connection_id}] Error during STT processing.")
+    finally:
+        os.unlink(path)  # cleanup temp file
+        conn["audio_buffer"] = b""  # clear buffer
+
+
+
+def process_stt(connection_id, pcm_data, final=False):
+    try:
+        conn = active_connections.get(connection_id)
+        if not conn:
+            return
+
+        wav_b64 = save_pcm_as_wav(pcm_data, sample_rate=8000)
+        if not wav_b64:
+            logger.error(f"[{connection_id}] Failed to convert PCM to WAV")
+            return
+
+        response = requests.post(
+            "wss://api.sarvam.ai/speech-to-text/ws?language-code=ml-IN&model=saarika%3Av2.5",  # Replace with actual Sarvam STT endpoint
+            json={
+                "audio": {
+                    "data": wav_b64,
+                    "encoding": "audio/wav",
+                    "sample_rate": "8000"
+                }
+            }
+        )
+        transcript = response.json().get("transcript", "")
+        logger.info(f"[{connection_id}] Transcription: {transcript}")
+
+        if transcript:
+            reply_text = gemini_client.get_response(transcript)
+            logger.info(f"[{connection_id}] Gemini reply: {reply_text}")
+
+            # TTS using Sarvam
+            tts_audio = sarvam_client.synthesize(reply_text)
+            send_audio_response(connection_id, tts_audio)
+
+    except Exception as e:
+        logger.exception(f"[{connection_id}] Error in process_stt()")
+
 
 def process_gemini_response(connection_id, user_text):
     """Get response from Gemini and convert to speech"""
