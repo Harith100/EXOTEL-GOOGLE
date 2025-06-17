@@ -1,2 +1,5 @@
+ignore
 .env
 gunicorn.config.py
+ignore/app.py
+ignore/requirements.txt
