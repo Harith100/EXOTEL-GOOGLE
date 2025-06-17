@@ -138,6 +138,7 @@ def handle_connected(connection_id, data):
     
     # Send initial greeting
     greeting_text = "നമസ്കാരം! ഞാൻ നിങ്ങളുടെ AI സഹായകനാണ്. എന്തെങ്കിലും സഹായം വേണോ?"
+    logger.info(f"Sending greeting: {greeting_text}")
     
     # Convert to audio and send
     Thread(target=send_tts_response, args=(connection_id, greeting_text)).start()
@@ -167,6 +168,7 @@ def handle_media(connection_id, data):
         # Decode audio from base64
         pcm_data = base64.b64decode(payload_b64)
         conn['audio_buffer'] += pcm_data
+        logger.info(f"[{connection_id}] Received audio chunk, buffer size: {len(conn['audio_buffer'])} bytes")
 
         # --- SILENCE DETECTION START ---
         silence_threshold = 500  # Experimentally adjust if needed
@@ -221,6 +223,7 @@ def handle_stop(connection_id, data):
 def process_audio_chunk(connection_id, final=False):
     """Process accumulated audio buffer"""
     if connection_id not in active_connections:
+        logger.warning(f"No active connection for ID: {connection_id}")
         return
         
     connection = active_connections[connection_id]
@@ -236,10 +239,12 @@ def process_audio_chunk(connection_id, final=False):
             return
             
         audio_chunk = audio_buffer[:chunk_size]
+        logger.info(f"Processing audio chunk for connection {connection_id}, size: {len(audio_chunk)} bytes")
         connection['audio_buffer'] = audio_buffer[chunk_size:]
         
         # Convert audio format for Sarvam (PCM 8kHz to required format)
         processed_audio = audio_utils.process_audio_for_stt(audio_chunk)
+        logger.info(f"Processing audio chunk for connection {connection_id}, size: {len(processed_audio)} bytes")
         
         # Send to STT in separate thread to avoid blocking
         Thread(target=process_stt, args=(connection_id, processed_audio, final)).start()
@@ -252,6 +257,9 @@ def process_stt(connection_id, audio_data, final=False):
     try:
         # Send audio to Sarvam STT
         transcript = sarvam_client.speech_to_text(audio_data, final=final)
+        if transcript is None:
+            logger.error(f"STT returned None for connection {connection_id}")
+            return
         
         if transcript and transcript.strip():
             logger.info(f"Transcript: {transcript}")
@@ -266,6 +274,7 @@ def process_gemini_response(connection_id, user_text):
     """Get response from Gemini and convert to speech"""
     try:
         if connection_id not in active_connections:
+            logger.warning(f"No active connection for ID: {connection_id}")
             return
             
         # Get conversation context
@@ -273,6 +282,9 @@ def process_gemini_response(connection_id, user_text):
         
         # Get response from Gemini
         response_text = gemini_client.get_response(user_text, context)
+        if response_text is None:
+            logger.error(f"Gemini response is None for connection {connection_id}")
+            return
         
         if response_text:
             logger.info(f"Gemini response: {response_text}")
@@ -285,6 +297,8 @@ def process_gemini_response(connection_id, user_text):
             
             # Convert to speech and send
             send_tts_response(connection_id, response_text)
+            if send_tts_response is None:
+                logger.error(f"Failed to send TTS response for connection {connection_id}")
             
     except Exception as e:
         logger.error(f"Gemini processing error: {str(e)}")
@@ -302,9 +316,10 @@ def send_tts_response(connection_id, text):
         audio_data = sarvam_client.text_to_speech(text)
         
         if audio_data:
+            logger.info(f"Audio data length: {len(audio_data)} bytes")
             # Convert audio format for Exotel (to PCM 8kHz mono)
             processed_audio = audio_utils.process_audio_for_playback(audio_data)
-            
+            logger.info(f"Processed audio length: {len(processed_audio)} bytes")
             # Split into chunks and send
             chunk_size = 3200  # 100ms chunks
             for i in range(0, len(processed_audio), chunk_size):
@@ -317,7 +332,7 @@ def send_tts_response(connection_id, text):
                 
                 # Encode and send
                 encoded_chunk = base64.b64encode(chunk).decode('utf-8')
-                
+                logger.info(f"Sending audio chunk: {encoded_chunk[:20]}...")  # Log first 20 chars
                 media_message = {
                     "event": "media",
                     "streamSid": "outbound_stream",
