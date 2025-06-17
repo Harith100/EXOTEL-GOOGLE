@@ -73,6 +73,7 @@ def init_call():
             "status": "initialized",
             "call_sid": call_sid
         }
+        logger.info(f"response: {response}")
         
         logger.info(f"Returning WebSocket URL: {ws_url}")
         return jsonify(response)

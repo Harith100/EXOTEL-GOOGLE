@@ -18,6 +18,7 @@ class SarvamClient:
         self.api_key = os.getenv("SARVAM_API_KEY")
         if not self.api_key:
             raise ValueError("SARVAM_API_KEY environment variable is required")
+            logger.error("SARVAM_API_KEY not set")  
         
         self.base_url = "https://api.sarvam.ai"
         self.headers = {
@@ -69,9 +70,11 @@ class SarvamClient:
                 json=payload,
                 timeout=30
             )
+
             
             if response.status_code == 200:
                 result = response.json()
+                logger.info(f"TTS response: {result}")
                 if 'audios' in result and len(result['audios']) > 0:
                     audio_base64 = result['audios'][0]
                     wav_audio_bytes = base64.b64decode(audio_base64)
@@ -127,6 +130,8 @@ class SarvamClient:
             # Test with a simple TTS request
             test_text = "പരീക്ഷണം"  # "Test" in Malayalam
             result = self.text_to_speech(test_text)
+            if result is None:
+                logger.error("Connection test failed: No audio returned")
             return result is not None
             
         except Exception as e:
@@ -140,6 +145,7 @@ class SarvamClient:
             # Write PCM bytes to a WAV file using tempfile
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
                 with wave.open(temp_wav.name, 'wb') as wf:
+                    logger.info(f"Writing audio data to temporary WAV file: {temp_wav.name}")
                     wf.setnchannels(1)
                     wf.setsampwidth(2)  # 16-bit PCM = 2 bytes
                     wf.setframerate(8000)
@@ -173,8 +179,12 @@ class SarvamClient:
                 )
 
             if response.status_code == 200:
+                logger.info("STT processing successful")
                 result = response.json()
+                logger.info(f"STT response: {result}")
                 transcript = result.get('transcript', '').strip()
+                if not transcript:
+                    logger.warning("STT returned empty transcript")
                 return transcript if transcript else None
             else:
                 logger.error(f"STT API error: {response.status_code} - {response.text}")

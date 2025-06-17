@@ -36,8 +36,10 @@ class AudioUtils:
         """
         try:
             if not audio_data:
+                logger.warning("Empty audio data provided for STT")
                 return b''
-                
+        
+            
             # Exotel sends 8kHz, 16-bit, mono PCM (little-endian)
             # Sarvam expects the same format, so minimal processing needed
             
@@ -48,6 +50,7 @@ class AudioUtils:
                 audio_data += b'\x00' * padding_needed
                 
             return audio_data
+        
             
         except Exception as e:
             logger.error(f"Error processing audio for STT: {str(e)}")
@@ -65,17 +68,23 @@ class AudioUtils:
         """
         try:
             if not audio_data:
+                logger.warning("Empty audio data provided for playback")
                 return b''
             
             # Try to detect if it's WAV format
             if self._is_wav_format(audio_data):
                 # Extract PCM data from WAV
                 pcm_data = self._extract_pcm_from_wav(audio_data)
+                if pcm_data is None:
+                    logger.error("Failed to extract PCM from WAV data")
+                    return b''
                 if pcm_data:
+                    logger.info(f"Extracted PCM data length: {len(pcm_data)} bytes")
                     audio_data = pcm_data
             
             # Convert to numpy array for processing
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
+
             
             # Ensure mono (if stereo, convert to mono)
             if len(audio_array) % 2 == 0:  # Might be stereo
@@ -92,6 +101,9 @@ class AudioUtils:
             
             # Convert back to bytes
             processed_audio = audio_array.tobytes()
+            if not processed_audio:
+                logger.error("Processed audio data is empty after conversion")
+                return b''
             
             # Ensure frame alignment
             if len(processed_audio) % self.frame_size != 0:
@@ -106,6 +118,7 @@ class AudioUtils:
     
     def _is_wav_format(self, audio_data: bytes) -> bool:
         """Check if audio data is in WAV format"""
+
         return audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:12]
     
     def _extract_pcm_from_wav(self, wav_data: bytes) -> Optional[bytes]:
@@ -122,6 +135,7 @@ class AudioUtils:
                 
                 # Read all frames
                 pcm_data = wav_file.readframes(wav_file.getnframes())
+                logger.info(f"Extracted PCM data length: {len(pcm_data)} bytes")
                 
                 # Convert to target format if needed
                 if sample_rate != self.exotel_sample_rate or channels != 1 or sample_width != 2:
@@ -172,6 +186,7 @@ class AudioUtils:
             
             # Convert back to 16-bit integers
             audio_array = np.clip(audio_array * 32767, -32768, 32767).astype(np.int16)
+            logger.info(f"Converted audio length: {len(audio_array)} samples")
             
             return audio_array.tobytes()
             
