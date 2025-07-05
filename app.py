@@ -235,7 +235,7 @@ async def ws_exotel(websocket: WebSocket):
                         timestamp = str(int(time.time() * 1000))
                         chunk_idx = 1
 
-                                                chunk_sent = False
+                        chunk_sent = False
                         for chunk in chunk_pcm(pcm_reply):
                             payload_b64 = base64.b64encode(chunk).decode()
                             await websocket.send_json({
