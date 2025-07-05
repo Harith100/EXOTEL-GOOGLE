@@ -3,3 +3,4 @@ ignore
 gunicorn.config.py
 ignore/app.py
 ignore/requirements.txt
+env310

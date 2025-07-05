@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vytiri-voicebot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port 10000"
+    plan: free
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SARVAMAI_API_KEY
+        sync: false
+

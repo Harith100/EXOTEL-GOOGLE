@@ -1,416 +1,238 @@
-from flask import Flask, request, jsonify
-from flask_sock import Sock
-import json
-import base64
-import asyncio
-import logging
-from threading import Thread
 import os
-from sarvam_client import SarvamClient
-from gemini_client import GeminiClient
-from utils import AudioUtils
-import socket
-import wave
-import struct
 import time
-import tempfile
-import io
-import requests
-
+import base64
+import uuid
+import wave
+import asyncio
+import numpy as np
+import logging
+from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi.responses import JSONResponse
+from collections import deque
+from sarvamai import SarvamAI
+from groq import Groq
+import uvicorn
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s %(name)s:%(message)s',
+)
+logger = logging.getLogger("exotel_bot")
 
-app = Flask(__name__)
-sock = Sock(app)
+# Load environment variables
+load_dotenv()
+SARVAMAI_API_KEY = os.getenv("SARVAMAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Initialize clients
-sarvam_client = SarvamClient()
-gemini_client = GeminiClient()
-audio_utils = AudioUtils()
+# Initialize AI clients
+sarvam_client = SarvamAI(api_subscription_key=SARVAMAI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Store active connections
-active_connections = {}
+# Audio configuration
+SAMPLE_RATE = 8000
+SAMPLE_WIDTH = 2
+CHANNELS = 1
+CHUNK_ALIGNMENT = 320
+CHUNK_MIN_SIZE = 3200  # 100ms
+SILENCE_THRESHOLD = 500
+SILENCE_DURATION = 2.0  # seconds of silence to trigger processing
 
-@app.route("/dns-test")
-def dns_test():
+# FastAPI app
+app = FastAPI()
+
+# Health endpoint
+@app.get("/health")
+async def health_check():
     try:
-        ip = socket.gethostbyname("api.sarvam.ai")
-        return f"api.sarvam.ai resolved to: {ip}"
-    except Exception as e:
-        return f"DNS resolution failed: {str(e)}"
+        assert sarvam_client is not None
+        assert groq_client is not None
+        return JSONResponse(status_code=200, content={"status": "ok"})
+    except Exception:
+        logger.error("Health check failed: AI clients not initialized")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
 
-@app.route('/init', methods=['GET', 'POST'])
-def init_call():
-    """
-    Initial endpoint that Exotel hits to get WebSocket URL
-    """
-    try:
-        # Get call data from Exotel (can be GET params or POST JSON)
-        if request.method == 'GET':
-            call_data = request.args.to_dict()
-        else:
-            call_data = request.get_json() or {}
-        
-        call_sid = call_data.get('CallSid', 'unknown')
-        
-        logger.info(f"Initializing call: {call_sid}")
-        logger.info(f"Call data: {call_data}")
-        logger.info(f"Request method: {request.method}")
-        logger.info(f"Request host: {request.host}")
-        logger.info(f"Request URL: {request.url}")
-        
-        # Return WebSocket URL for media streaming
-        # Get the base URL and construct WebSocket URL
-        if request.is_secure or 'https' in request.url:
-            ws_protocol = 'wss'
-        else:
-            ws_protocol = 'ws'
-            
-        # Use request.host to get the proper domain
-        ws_url = f"{ws_protocol}://{request.host}/media"
-        
-        response = {
-            "url": ws_url,
-            "status": "initialized",
-            "call_sid": call_sid
-        }
-        logger.info(f"response: {response}")
-        
-        logger.info(f"Returning WebSocket URL: {ws_url}")
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"Error in init_call: {str(e)}")
-        return jsonify({"error": "Initialization failed"}), 500
+# History for the LLM (system prompt)
+history = [{
+    "role": "system",
+    "content": """
+നീ മലയാളത്തിൽ സംസാരിക്കുന്ന ഒരു വോയ്സ് കോളിന്റെ അസിസ്റ്റന്റാണ്. താങ്കളുടെ ജോലി വയനാട്ടിലെ വൈത്തിരി പാർക്കിന്റെ സന്ദർശകരുമായി സൗഹൃദപരമായ രീതിയിൽ സംസാരിക്കുകയും, അവരുടെ സംശയങ്ങൾക്കും ചോദ്യങ്ങൾക്കും വ്യക്തമായ മറുപടികൾ നൽകുകയും ചെയ്യുകയാണ്. താങ്കൾക്ക് എല്ലാവിധ മറുപടികളും ത്യാജ്യരീതിയിൽ, വിനീതതയോടെ നൽകേണ്ടതാണ്.
 
-@sock.route('/media')
-def media_handler(ws):
-    """
-    WebSocket handler for real-time audio streaming
-    """
-    connection_id = id(ws)
-    active_connections[connection_id] = {
-        'ws': ws,
-        'audio_buffer': b'',
-        'conversation_context': []
-    }
+വൈത്തിരി പാർക്ക് വയനാട്ടിലെ വൈത്തിരിയിലാണ് സ്ഥിതി ചെയ്യുന്നത്. മനോഹരമായ മലനിരകൾ, പച്ചക്കാടുകൾ, മഞ്ഞുമൂടിയ കാലാവസ്ഥ തുടങ്ങിയ പ്രകൃതിദൃശ്യങ്ങൾക്കിടയിൽ സ്ഥിതി ചെയ്യുന്ന ഈ പാർക്ക് സാഹസിക വിനോദത്തിനും കുടുംബസമേതം സമയം ചെലവിടുന്നതിനും അനുയോജ്യമായ സ്ഥലമാണ്.
+
+ഈ പാർക്കിൽ 40-ലധികം റൈഡുകൾ ലഭ്യമാണ്. അതിൽ അഡ്വഞ്ചർ റൈഡുകളും, അമ്യൂസ്മെന്റ് റൈഡുകളും, വാട്ടർ സ്ലൈഡുകളും ഉൾപ്പെടുന്നു. എല്ലാ പ്രായമുള്ള ആളുകൾക്കും അനുയോജ്യമായ രീതിയിലാണ് ആമസ്മെന്റ് ഒരുക്കങ്ങൾ രൂപകൽപ്പന ചെയ്തിരിക്കുന്നത്.
+
+വൈത്തിരി പാർക്ക് ഓരോ ദിവസവും രാവിലെ 9 മണി മുതൽ വൈകിട്ട് 6 മണി വരെ തുറന്നിരിക്കുന്നു.
+
+ടിക്കറ്റ് നിരക്കുകൾ ചുവടെ കാണാം:
+- മുതിർന്നവർക്ക് ₹799 രൂപയാണ്.
+- കുട്ടികൾക്ക് (ഉയരം 90 സെ.മി. മുതൽ 120 സെ.മി. വരെ) ₹599 രൂപയാണ്.
+- മുതിർന്ന പൗരന്മാർക്ക് ₹300 രൂപയാണ്.
+
+ഒരു സന്ദർശകനായി താങ്കൾ എന്തെങ്കിലും സംശയങ്ങൾ ഉന്നയിച്ചാൽ അതിന് ചുരുങ്ങിയതും വ്യക്തവുമായ മറുപടി നൽകേണ്ടതുണ്ട്. കൂടുതൽ വിശദീകരണം ആവശ്യമെങ്കിൽ, "കൂടുതൽ വിവരങ്ങൾക്ക് ഞങ്ങളുടെ സെൽസ് എക്സിക്യൂട്ടീവുമായി ബന്ധപ്പെടാമോ?" എന്ന് അകൃത്യമായും വിനീതമായും ചോദിക്കുക.
+
+താങ്കളുടെ മറുപടികൾ എല്ലാം മലയാളത്തിലായിരിക്കണം. സന്ദർശകർക്ക് സഹായകരമായ ഉത്തരം നൽകാൻ ഉദ്ദേശിച്ചുകൊണ്ട് ചുരുങ്ങിയ വാക്കുകളിൽ സൗമ്യമായി പ്രതികരിക്കുക.
+"""
+}]
+
+# -- Utility functions --
+# Utility functions for audio processing and AI interactions
+def is_silence(audio_bytes: bytes) -> bool:
     
-    logger.info(f"New WebSocket connection: {connection_id}")
-    
+    audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+    rms = np.sqrt(np.mean(audio_np ** 2))
+    logger.debug(f"RMS: {rms}")
+    return rms < SILENCE_THRESHOLD
+
+
+def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
+    logger.debug(f"Writing PCM to WAV: {wav_path}")
+    with wave.open(wav_path, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm_data)
+
+
+def transcribe_pcm(pcm_data: bytes) -> str:
+    temp_file = f"temp_{uuid.uuid4().hex}.wav"
+    pcm_to_wav(pcm_data, temp_file)
+    logger.info("Starting transcription")
+    with open(temp_file, 'rb') as wf:
+        result = sarvam_client.speech_to_text.transcribe(
+            file=wf,
+            model="saarika:v2.5",
+            language_code="ml-IN"
+        )
+    os.remove(temp_file)
+    transcript = result.transcript.strip()
+    logger.info(f"Transcript: {transcript}")
+    return transcript
+
+
+def llm_respond(transcript: str) -> str:
+    logger.info(f"LLM received: {transcript}")
+    history.append({"role": "user", "content": transcript})
+    if len(history) > 20:
+        history[:] = history[-20:]
+    resp = groq_client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=history,
+        temperature=0.5
+    )
+    reply = resp.choices[0].message.content.strip()
+    logger.info(f"LLM reply: {reply}")
+    history.append({"role": "assistant", "content": reply})
+    return reply
+
+
+def text_to_pcm(text: str) -> bytes:
+    logger.info("Converting text to PCM via TTS")
+    resp = sarvam_client.text_to_speech.convert(
+        text=text,
+        target_language_code="ml-IN",
+        speaker="manisha",
+        enable_preprocessing=True,
+        speech_sample_rate=SAMPLE_RATE
+    )
+    pcm = b"".join(base64.b64decode(chunk) for chunk in resp.audios)
+    logger.debug(f"Generated PCM length: {len(pcm)}")
+    return pcm
+
+
+def chunk_pcm(pcm_data: bytes, size: int = CHUNK_MIN_SIZE):
+    for i in range(0, len(pcm_data), size):
+        chunk = pcm_data[i:i+size]
+        trim = len(chunk) % CHUNK_ALIGNMENT
+        if trim:
+            chunk = chunk[:-trim]
+        if chunk:
+            yield chunk
+
+# -- WebSocket endpoint --
+
+@app.websocket("/ws")
+async def ws_exotel(websocket: WebSocket):
+    await websocket.accept()
+    stream_sid = None
+    audio_buffer = deque()
+    silence_start = None
+    seq_num = 1
+
+    logger.info("WebSocket connection accepted")
+
     try:
         while True:
-            # Receive message from Exotel
-            message = ws.receive()
-            
-            if not message:
-                break
-                
-            try:
-                data = json.loads(message)
-                event_type = data.get('event')
-                logger.info(f"Received event: {event_type}")
+            msg = await websocket.receive_json()
+            event = msg.get("event")
+            logger.debug(f"Received event: {event}")
 
-                if event_type == 'connected':
-                    handle_connected(connection_id, data)
-                    
-                elif event_type == 'start':
-                    handle_start(connection_id, data)
-                    
-                elif event_type == 'media':
-                    handle_media(connection_id, data)
-                    
-                elif event_type == 'stop':
-                    handle_stop(connection_id, data)
-                    
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error: {str(e)}")
+            if event == "connected":
+                logger.info("Connected event received")
                 continue
-                
-    except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}")
-    finally:
-        # Clean up connection
-        if connection_id in active_connections:
-            del active_connections[connection_id]
-        logger.info(f"WebSocket connection closed: {connection_id}")
 
-def handle_connected(connection_id, data):
-    """Handle WebSocket connected event"""
-    logger.info(f"Connection {connection_id} established")
-    
-    # Send initial greeting
-    greeting_text = "നമസ്കാരം! ഞാൻ നിങ്ങളുടെ AI സഹായകനാണ്. എന്തെങ്കിലും സഹായം വേണോ?"
-    logger.info(f"Sending greeting: {greeting_text}")
-    
-    # Convert to audio and send
-    Thread(target=send_tts_response, args=(connection_id, greeting_text)).start()
+            if event == "start":
+                stream_sid = msg.get("stream_sid")
+                logger.info(f"Stream started: {stream_sid}")
+                continue
 
-def handle_start(connection_id, data):
-    """Handle stream start event"""
-    logger.info(f"Stream started for connection {connection_id}")
-    active_connections[connection_id]['stream_active'] = True
+            if event == "media":
+                payload = base64.b64decode(msg["media"]["payload"])
+                audio_buffer.append(payload)
+                logger.debug(f"Buffered media chunk, size={len(payload)}")
 
-def handle_media(connection_id, data):
-    try:
-        conn = active_connections.get(connection_id)
-        if not conn:
-            logger.warning(f"No active connection for ID: {connection_id}")
-            return
+                if is_silence(payload):
+                    if silence_start is None:
+                        silence_start = time.time()
+                        logger.debug("Silence detected, starting timer")
+                    elif time.time() - silence_start >= SILENCE_DURATION:
+                        pcm_data = b"".join(audio_buffer)
+                        audio_buffer.clear()
+                        silence_start = None
+                        logger.info("Processing buffered audio after silence")
 
-        media = data.get("media", {})
-        payload_b64 = media.get("payload", "")
-        chunk_id = media.get("chunk")
-        timestamp = media.get("timestamp")
+                        transcript = transcribe_pcm(pcm_data)
+                        if not transcript:
+                            continue
 
-        #logger.info(f"[{connection_id}] Media received — Chunk: {chunk_id}, Timestamp: {timestamp}, Payload length: {len(payload_b64)}")
+                        reply = llm_respond(transcript)
+                        pcm_reply = text_to_pcm(reply)
 
-        if not payload_b64:
-            return
+                        timestamp = str(int(time.time() * 1000))
+                        chunk_idx = 1
+                        for chunk in chunk_pcm(pcm_reply):
+                            await websocket.send_json({
+                                "event": "media",
+                                "sequence_number": seq_num,
+                                "stream_sid": stream_sid,
+                                "media": {"chunk": chunk_idx, "timestamp": timestamp, "payload": base64.b64encode(chunk).decode()}
+                            })
+                            logger.debug(f"Sent media chunk {chunk_idx}, seq={seq_num}")
+                            seq_num += 1
+                            chunk_idx += 1
+                            await asyncio.sleep(0.1)
 
-        # Decode audio from base64
-        pcm_data = base64.b64decode(payload_b64)
-        conn['audio_buffer'] += pcm_data
-        logger.info(f"[{connection_id}] Received audio chunk, buffer size: {len(conn['audio_buffer'])} bytes")
+                        await websocket.send_json({
+                            "event": "mark",
+                            "sequence_number": seq_num,
+                            "stream_sid": stream_sid,
+                            "mark": {"name": "end-of-reply"}
+                        })
+                        logger.info(f"Sent mark event, seq={seq_num}")
+                        seq_num += 1
 
-        # --- SILENCE DETECTION START ---
-        silence_threshold = 500  # Experimentally adjust if needed
-        silent = True
-        for i in range(0, len(pcm_data), 2):
-            sample = int.from_bytes(pcm_data[i:i+2], byteorder='little', signed=True)
-            if abs(sample) > silence_threshold:
-                silent = False
+            if event == "stop":
+                logger.info("Stop event received; closing connection")
                 break
 
-        now = time.time()
-        conn.setdefault('last_voice_ts', now)
-        conn.setdefault('silence_start_ts', None)
-
-        if silent:
-            if conn['silence_start_ts'] is None:
-                conn['silence_start_ts'] = now
-            elif now - conn['silence_start_ts'] >= 2.0:
-                logger.info(f"[{connection_id}] Detected 2s silence — triggering STT")
-                process_audio_chunk(connection_id)
-                conn['silence_start_ts'] = None
-        else:
-            conn['silence_start_ts'] = None
-            conn['last_voice_ts'] = now
-        # --- SILENCE DETECTION END ---
-
-        # Optional: Save raw audio for debugging
-        with open(f"debug_raw_{connection_id}.pcm", "ab") as f:
-            f.write(pcm_data)
-
     except Exception as e:
-        logger.exception(f"[{connection_id}] Error in handle_media")
-
-
-#def save_pcm_as_wav(pcm_data, path, sample_rate=8000):
-def save_pcm_as_wav(pcm_data: bytes, sample_rate: int = 8000) -> str:
-    """Convert raw PCM bytes to base64 WAV string (in-memory)."""
-    buffer = io.BytesIO()
-    with wave.open(buffer, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit PCM = 2 bytes
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_data)
-    wav_bytes = buffer.getvalue()
-    return base64.b64encode(wav_bytes).decode('utf-8')
-
-def handle_stop(connection_id, data):
-    """Handle stream stop event"""
-    logger.info(f"Stream stopped for connection {connection_id}")
-    if connection_id in active_connections:
-        active_connections[connection_id]['stream_active'] = False
-        # Process any remaining audio
-        if active_connections[connection_id]['audio_buffer']:
-            process_audio_chunk(connection_id, final=True)
-
-def process_audio_chunk(connection_id):
-    conn = active_connections.get(connection_id)
-    if not conn:
-        logger.warning(f"No connection found for ID: {connection_id}")
-        return
-
-    pcm_data = conn.get("audio_buffer", b"")
-    if not pcm_data:
-        logger.info(f"[{connection_id}] No audio data to process.")
-        return
-
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-            path = tmp_wav.name
-            save_pcm_as_wav(pcm_data, path)
-            logger.info(f"[{connection_id}] Saved audio to WAV: {path}")
-
-            # Example STT usage
-            transcription = sarvam_client.speech_to_text(path)
-            logger.info(f"[{connection_id}] Transcription: {transcription}")
-
-    except Exception as e:
-        logger.exception(f"[{connection_id}] Error during STT processing.")
+        logger.error(f"WebSocket error: {e}")
     finally:
-        os.unlink(path)  # cleanup temp file
-        conn["audio_buffer"] = b""  # clear buffer
+        await websocket.close()
+        logger.info("WebSocket closed")
 
-
-
-def process_stt(connection_id, pcm_data, final=False):
-    try:
-        conn = active_connections.get(connection_id)
-        if not conn:
-            return
-
-        wav_b64 = save_pcm_as_wav(pcm_data, sample_rate=8000)
-        if not wav_b64:
-            logger.error(f"[{connection_id}] Failed to convert PCM to WAV")
-            return
-
-        response = requests.post(
-            "wss://api.sarvam.ai/speech-to-text/ws?language-code=ml-IN&model=saarika%3Av2.5",  # Replace with actual Sarvam STT endpoint
-            json={
-                "audio": {
-                    "data": wav_b64,
-                    "encoding": "audio/wav",
-                    "sample_rate": "8000"
-                }
-            }
-        )
-        transcript = response.json().get("transcript", "")
-        logger.info(f"[{connection_id}] Transcription: {transcript}")
-
-        if transcript:
-            reply_text = gemini_client.get_response(transcript)
-            logger.info(f"[{connection_id}] Gemini reply: {reply_text}")
-
-            # TTS using Sarvam
-            tts_audio = sarvam_client.synthesize(reply_text)
-            send_audio_response(connection_id, tts_audio)
-
-    except Exception as e:
-        logger.exception(f"[{connection_id}] Error in process_stt()")
-
-
-def process_gemini_response(connection_id, user_text):
-    """Get response from Gemini and convert to speech"""
-    try:
-        if connection_id not in active_connections:
-            logger.warning(f"No active connection for ID: {connection_id}")
-            return
-            
-        # Get conversation context
-        context = active_connections[connection_id]['conversation_context']
-        
-        # Get response from Gemini
-        response_text = gemini_client.get_response(user_text, context)
-        if response_text is None:
-            logger.error(f"Gemini response is None for connection {connection_id}")
-            return
-        
-        if response_text:
-            logger.info(f"Gemini response: {response_text}")
-            
-            # Update conversation context
-            context.append({"user": user_text, "assistant": response_text})
-            # Keep only last 5 exchanges to manage context size
-            if len(context) > 5:
-                context.pop(0)
-            
-            # Convert to speech and send
-            send_tts_response(connection_id, response_text)
-            if send_tts_response is None:
-                logger.error(f"Failed to send TTS response for connection {connection_id}")
-            
-    except Exception as e:
-        logger.error(f"Gemini processing error: {str(e)}")
-
-def send_tts_response(connection_id, text):
-    """Convert text to speech and send back"""
-    try:
-        if connection_id not in active_connections:
-            return
-            
-        connection = active_connections[connection_id]
-        ws = connection['ws']
-        
-        # Get audio from Sarvam TTS
-        audio_data = sarvam_client.text_to_speech(text)
-        
-        if audio_data:
-            logger.info(f"Audio data length: {len(audio_data)} bytes")
-            # Convert audio format for Exotel (to PCM 8kHz mono)
-            processed_audio = audio_utils.process_audio_for_playback(audio_data)
-            logger.info(f"Processed audio length: {len(processed_audio)} bytes")
-            # Split into chunks and send
-            chunk_size = 3200  # 100ms chunks
-            for i in range(0, len(processed_audio), chunk_size):
-                chunk = processed_audio[i:i + chunk_size]
-                
-                # Pad chunk if necessary to maintain frame alignment
-                if len(chunk) % 320 != 0:
-                    padding = 320 - (len(chunk) % 320)
-                    chunk += b'\x00' * padding
-                
-                # Encode and send
-                encoded_chunk = base64.b64encode(chunk).decode('utf-8')
-                logger.info(f"Sending audio chunk: {encoded_chunk[:20]}...")  # Log first 20 chars
-                media_message = {
-                    "event": "media",
-                    "streamSid": "outbound_stream",
-                    "media": {
-                        "payload": encoded_chunk
-                    }
-                }
-                
-                try:
-                    ws.send(json.dumps(media_message))
-                except Exception as send_error:
-                    logger.error(f"Error sending audio chunk: {str(send_error)}")
-                    break
-                    
-    except Exception as e:
-        logger.error(f"TTS error: {str(e)}")
-
-@app.route('/test-init', methods=['GET', 'POST'])
-def test_init():
-    """Test endpoint to debug init calls"""
-    return jsonify({
-        "method": request.method,
-        "args": dict(request.args),
-        "json": request.get_json(),
-        "headers": dict(request.headers),
-        "url": request.url,
-        "host": request.host,
-        "is_secure": request.is_secure
-    })
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "active_connections": len(active_connections)})
-
-@app.route('/', methods=['GET'])
-def home():
-    """Basic home page"""
-    return jsonify({
-        "service": "Malayalam Voice AI Bot",
-        "status": "running",
-        "endpoints": {
-            "init": "/init",
-            "media": "wss://domain/media",
-            "health": "/health"
-        }
-    })
-
-if __name__ == '__main__':
-    # Get port from environment variable (Render sets this)
-    port = int(os.environ.get('PORT', 5000))
+if __name__ == "__main__":
     
-    # Run the app
-    app.run(
-        host='0.0.0.0',
-        port=port,
-        debug=False  # Set to False in production
-    )
+    uvicorn.run(app, host="0.0.0.0", port=10000)
+
