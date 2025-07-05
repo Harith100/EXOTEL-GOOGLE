@@ -13,6 +13,9 @@ from collections import deque
 from sarvamai import SarvamAI
 from groq import Groq
 import uvicorn
+from starlette.websockets import WebSocketState
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -155,7 +158,6 @@ def chunk_pcm(pcm_data: bytes, size: int = CHUNK_MIN_SIZE):
             yield chunk
 
 # -- WebSocket endpoint --
-
 @app.websocket("/ws")
 async def ws_exotel(websocket: WebSocket):
     await websocket.accept()
@@ -201,30 +203,63 @@ async def ws_exotel(websocket: WebSocket):
                             continue
 
                         reply = llm_respond(transcript)
-                        pcm_reply = text_to_pcm(reply)
+
+                        # Send keep-alive "thinking" mark
+                        if websocket.application_state == WebSocketState.CONNECTED:
+                            await websocket.send_json({
+                                "event": "mark",
+                                "sequence_number": seq_num,
+                                "stream_sid": stream_sid,
+                                "mark": {"name": "thinking"}
+                            })
+                            logger.debug(f"Sent keep-alive mark event, seq={seq_num}")
+                            seq_num += 1
+
+                        # Run TTS in a separate thread to avoid blocking
+                        try:
+                            pcm_reply = await asyncio.to_thread(text_to_pcm, reply)
+                        except Exception as e:
+                            logger.error(f"TTS failed: {e}")
+                            pcm_reply = await asyncio.to_thread(text_to_pcm, "ക്ഷമിക്കണം, തകരാറുണ്ടായി.")
 
                         timestamp = str(int(time.time() * 1000))
                         chunk_idx = 1
+
                         for chunk in chunk_pcm(pcm_reply):
+                            try:
+                                if websocket.application_state != WebSocketState.CONNECTED:
+                                    logger.warning("WebSocket closed mid-reply")
+                                    break
+
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "sequence_number": seq_num,
+                                    "stream_sid": stream_sid,
+                                    "media": {
+                                        "chunk": chunk_idx,
+                                        "timestamp": timestamp,
+                                        "payload": base64.b64encode(chunk).decode()
+                                    }
+                                })
+                                logger.debug(f"Sent media chunk {chunk_idx}, seq={seq_num}")
+                                seq_num += 1
+                                chunk_idx += 1
+                                await asyncio.sleep(0.02)
+
+                            except Exception as e:
+                                logger.error(f"Error sending media chunk: {e}")
+                                break
+
+                        # Send end-of-reply mark
+                        if websocket.application_state == WebSocketState.CONNECTED:
                             await websocket.send_json({
-                                "event": "media",
+                                "event": "mark",
                                 "sequence_number": seq_num,
                                 "stream_sid": stream_sid,
-                                "media": {"chunk": chunk_idx, "timestamp": timestamp, "payload": base64.b64encode(chunk).decode()}
+                                "mark": {"name": "end-of-reply"}
                             })
-                            logger.debug(f"Sent media chunk {chunk_idx}, seq={seq_num}")
+                            logger.info(f"Sent mark event, seq={seq_num}")
                             seq_num += 1
-                            chunk_idx += 1
-                            await asyncio.sleep(0.1)
-
-                        await websocket.send_json({
-                            "event": "mark",
-                            "sequence_number": seq_num,
-                            "stream_sid": stream_sid,
-                            "mark": {"name": "end-of-reply"}
-                        })
-                        logger.info(f"Sent mark event, seq={seq_num}")
-                        seq_num += 1
 
             if event == "stop":
                 logger.info("Stop event received; closing connection")
