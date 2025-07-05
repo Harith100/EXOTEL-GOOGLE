@@ -13,7 +13,7 @@ from collections import deque
 from sarvamai import SarvamAI
 from groq import Groq
 import uvicorn
-from starlette.websockets import WebSocketState
+from starlette.websockets import WebSocketState, WebSocketDisconnect
 
 # Configure logging
 logging.basicConfig(
@@ -37,10 +37,10 @@ SAMPLE_WIDTH = 2
 CHANNELS = 1
 CHUNK_ALIGNMENT = 320  # Exotel requires chunks to be multiples of 320 bytes
 CHUNK_MIN_SIZE = 3200  # 100ms minimum as per Exotel requirements
-CHUNK_MAX_SIZE = 32000  # Smaller max size for quicker processing
+CHUNK_MAX_SIZE = 9600  # Smaller max size (30ms) for quicker delivery
 SILENCE_THRESHOLD = 300  # Lower threshold to detect silence more aggressively
-SILENCE_DURATION = 0.5  # Shorter silence duration to trigger processing
-PROCESS_INTERVAL = 1.0  # Process every second even without silence
+SILENCE_DURATION = 0.5  # Seconds of silence to trigger processing
+MAX_BUFFER_SIZE = 48000  # Max buffer size (6 seconds of audio at 8KHz)
 
 # FastAPI app
 app = FastAPI()
@@ -126,7 +126,7 @@ async def llm_respond(transcript: str) -> str:
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=history,
             temperature=0.5,
-            max_tokens=150  # Keep responses short for faster processing
+            max_tokens=80  # Keep responses shorter for faster processing
         )
         reply = resp.choices[0].message.content.strip()
         logger.info(f"LLM reply: {reply}")
@@ -154,9 +154,16 @@ async def text_to_pcm(text: str) -> bytes:
         # Generate a simple error message audio if TTS fails
         return b'\x00' * CHUNK_MIN_SIZE  # Silent audio as fallback
 
+def align_chunk_size(size):
+    """Align chunk size to be a multiple of 320 bytes"""
+    return size - (size % CHUNK_ALIGNMENT)
+
 def chunk_pcm(pcm_data: bytes) -> list:
     """
-    Chunk PCM data according to Exotel requirements
+    Chunk PCM data according to Exotel requirements:
+    - Chunks must be multiples of 320 bytes
+    - Minimum size: 3200 bytes (100ms)
+    - Maximum size: CHUNK_MAX_SIZE bytes
     """
     if not pcm_data or len(pcm_data) < CHUNK_MIN_SIZE:
         return []
@@ -166,9 +173,14 @@ def chunk_pcm(pcm_data: bytes) -> list:
     while i < len(pcm_data):
         # Calculate chunk size (min 3200, max CHUNK_MAX_SIZE, multiple of 320)
         chunk_size = min(CHUNK_MAX_SIZE, len(pcm_data) - i)
-        chunk_size = chunk_size - (chunk_size % CHUNK_ALIGNMENT)
+        chunk_size = align_chunk_size(chunk_size)
         
         if chunk_size < CHUNK_MIN_SIZE:
+            # If remaining data is less than minimum, append to previous chunk
+            # if possible, otherwise discard
+            if chunks and i + chunk_size <= len(pcm_data):
+                last_chunk = chunks.pop()
+                chunks.append(last_chunk + pcm_data[i:i+chunk_size])
             break
             
         chunks.append(pcm_data[i:i+chunk_size])
@@ -187,60 +199,6 @@ async def safe_send_json(websocket, data):
         logger.error(f"Error sending data over websocket: {e}")
         return False
 
-async def send_audio_response(websocket, stream_sid, seq_num, text):
-    """Send an audio response to the user"""
-    if not text or not stream_sid:
-        return seq_num
-        
-    try:
-        # Convert text to audio
-        pcm_data = await text_to_pcm(text)
-        chunks = chunk_pcm(pcm_data)
-        
-        if not chunks:
-            logger.warning("No audio chunks to send")
-            return seq_num
-            
-        # Send audio chunks
-        timestamp = str(int(time.time() * 1000))
-        for idx, chunk in enumerate(chunks, 1):
-            if websocket.application_state != WebSocketState.CONNECTED:
-                logger.warning("WebSocket disconnected while sending audio")
-                break
-                
-            success = await safe_send_json(websocket, {
-                "event": "media",
-                "sequence_number": seq_num,
-                "stream_sid": stream_sid,
-                "media": {
-                    "chunk": idx,
-                    "timestamp": timestamp,
-                    "payload": base64.b64encode(chunk).decode()
-                }
-            })
-            
-            if not success:
-                break
-                
-            seq_num += 1
-            # Very small delay to avoid overwhelming Exotel
-            await asyncio.sleep(0.01)
-            
-        # Send end-of-response mark
-        if websocket.application_state == WebSocketState.CONNECTED:
-            await safe_send_json(websocket, {
-                "event": "mark",
-                "sequence_number": seq_num,
-                "stream_sid": stream_sid,
-                "mark": {"name": "response-complete"}
-            })
-            seq_num += 1
-            
-    except Exception as e:
-        logger.error(f"Error sending audio response: {e}")
-        
-    return seq_num
-
 # -- WebSocket endpoint --
 @app.websocket("/ws")
 async def ws_exotel(websocket: WebSocket):
@@ -250,53 +208,18 @@ async def ws_exotel(websocket: WebSocket):
     last_process_time = time.time()
     silence_start = None
     seq_num = 1
-    processing_task = None
-    is_closing = False
+    welcome_sent = False
+    is_processing = False
+    media_sent = False
+    processing_lock = asyncio.Lock()
 
     logger.info("WebSocket connection accepted")
 
-    async def process_audio_buffer():
-        nonlocal seq_num, audio_buffer
-        
-        if len(audio_buffer) < CHUNK_MIN_SIZE:
-            logger.debug("Audio buffer too small to process")
-            return
-            
-        # Make a copy of the buffer and clear the original
-        pcm_data = bytes(audio_buffer)
-        audio_buffer.clear()
-        
-        # Quick acknowledgment to keep connection alive
-        if stream_sid and websocket.application_state == WebSocketState.CONNECTED:
-            await safe_send_json(websocket, {
-                "event": "mark",
-                "sequence_number": seq_num,
-                "stream_sid": stream_sid,
-                "mark": {"name": "processing"}
-            })
-            seq_num += 1
-        
-        # Process the audio
-        transcript = await transcribe_pcm(pcm_data)
-        if not transcript:
-            logger.warning("No transcript detected")
-            return
-            
-        # Get LLM response
-        reply = await llm_respond(transcript)
-        
-        # Send audio response
-        if stream_sid and websocket.application_state == WebSocketState.CONNECTED:
-            seq_num = await send_audio_response(websocket, stream_sid, seq_num, reply)
-
     try:
-        # Send welcome message once connected
-        welcome_sent = False
-        
-        while not is_closing:
+        while True:
             try:
-                # Short timeout to regularly check buffer
-                msg = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
+                # Short timeout for receiving messages to keep processing responsive
+                msg = await asyncio.wait_for(websocket.receive_json(), timeout=0.2)
                 event = msg.get("event")
                 logger.debug(f"Received event: {event}")
 
@@ -311,8 +234,50 @@ async def ws_exotel(websocket: WebSocket):
                     # Send welcome message
                     if not welcome_sent and stream_sid:
                         welcome_text = "ഹലോ! വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം. എങ്ങനെ സഹായിക്കാൻ കഴിയും?"
-                        seq_num = await send_audio_response(websocket, stream_sid, seq_num, welcome_text)
-                        welcome_sent = True
+                        welcome_pcm = await text_to_pcm(welcome_text)
+                        
+                        # Split PCM data into smaller chunks to ensure consistent delivery
+                        chunks = chunk_pcm(welcome_pcm)
+                        
+                        if chunks:
+                            # Send each chunk with minimal delay
+                            timestamp = str(int(time.time() * 1000))
+                            chunk_count = len(chunks)
+                            
+                            for idx, chunk in enumerate(chunks, 1):
+                                if websocket.application_state != WebSocketState.CONNECTED:
+                                    break
+                                    
+                                success = await safe_send_json(websocket, {
+                                    "event": "media",
+                                    "sequence_number": seq_num,
+                                    "stream_sid": stream_sid,
+                                    "media": {
+                                        "chunk": idx,
+                                        "timestamp": timestamp,
+                                        "payload": base64.b64encode(chunk).decode()
+                                    }
+                                })
+                                
+                                if not success:
+                                    break
+                                    
+                                seq_num += 1
+                                # Wait 10ms between chunks to avoid overwhelming Exotel
+                                # This is important as per Exotel's documentation
+                                await asyncio.sleep(0.01)
+                            
+                            # Send mark to indicate welcome is complete
+                            if websocket.application_state == WebSocketState.CONNECTED:
+                                await safe_send_json(websocket, {
+                                    "event": "mark",
+                                    "sequence_number": seq_num,
+                                    "stream_sid": stream_sid,
+                                    "mark": {"name": "welcome-complete"}
+                                })
+                                seq_num += 1
+                                welcome_sent = True
+                                media_sent = True
                     continue
 
                 if event == "media":
@@ -320,10 +285,12 @@ async def ws_exotel(websocket: WebSocket):
                     audio_buffer.extend(payload)
                     logger.debug(f"Buffered media chunk, size={len(payload)}, total buffer={len(audio_buffer)}")
                     
+                    # Process immediately if we've received enough audio and 
+                    # we're not already processing
                     current_time = time.time()
                     should_process = False
                     
-                    # Check for silence to trigger processing
+                    # Process if we detect silence after speech
                     if is_silence(payload):
                         if silence_start is None:
                             silence_start = current_time
@@ -332,52 +299,62 @@ async def ws_exotel(websocket: WebSocket):
                     else:
                         silence_start = None
                     
-                    # Process based on time interval or buffer size
-                    if (current_time - last_process_time >= PROCESS_INTERVAL and len(audio_buffer) >= CHUNK_MIN_SIZE) or \
-                       len(audio_buffer) >= SAMPLE_RATE * SAMPLE_WIDTH * 3:  # Process after 3 seconds of audio
+                    # Also process if buffer gets large or too much time passed
+                    if len(audio_buffer) >= MAX_BUFFER_SIZE or \
+                       (len(audio_buffer) >= CHUNK_MIN_SIZE * 2 and current_time - last_process_time >= 2.0):
                         should_process = True
                     
-                    # Start processing if needed
-                    if should_process and len(audio_buffer) >= CHUNK_MIN_SIZE:
+                    # Start processing if needed and not already processing
+                    if should_process and len(audio_buffer) >= CHUNK_MIN_SIZE and not is_processing:
+                        # Make a copy of the buffer and clear the original
+                        audio_data = bytes(audio_buffer)
+                        audio_buffer.clear()
                         last_process_time = current_time
                         silence_start = None
                         
-                        # Cancel any existing processing task
-                        if processing_task and not processing_task.done():
-                            processing_task.cancel()
-                            
-                        # Start new processing task
-                        processing_task = asyncio.create_task(process_audio_buffer())
+                        # Process the audio
+                        is_processing = True
+                        asyncio.create_task(
+                            process_and_respond(websocket, stream_sid, audio_data, seq_num)
+                            .add_done_callback(lambda _: setattr(__builtins__, "is_processing", False))
+                        )
 
-                if event == "stop":
-                    logger.info("Stop event received")
-                    is_closing = True
-                    
-                    # Process any remaining audio before closing
-                    if len(audio_buffer) >= CHUNK_MIN_SIZE:
-                        await process_audio_buffer()
-                    break
-
-                # Handle mark events from Exotel
-                if event == "mark":
+                elif event == "mark":
+                    # Handle mark events from Exotel (e.g., audio processing completion)
                     mark_name = msg.get("mark", {}).get("name", "")
                     logger.info(f"Received mark event: {mark_name}")
-
+                    
+                    # If this is a mark indicating our audio was processed,
+                    # we can consider the media as sent
+                    if mark_name == "response-complete" or mark_name == "welcome-complete":
+                        media_sent = True
+                
+                elif event == "stop":
+                    logger.info("Stop event received - closing connection")
+                    break
+                
             except asyncio.TimeoutError:
-                # Check buffer regularly during timeout
-                current_time = time.time()
-                if len(audio_buffer) >= CHUNK_MIN_SIZE and current_time - last_process_time >= PROCESS_INTERVAL:
-                    last_process_time = current_time
-                    await process_audio_buffer()
+                # Check buffer periodically for automatic processing
+                if not is_processing and len(audio_buffer) >= CHUNK_MIN_SIZE * 2 and time.time() - last_process_time >= 2.0:
+                    audio_data = bytes(audio_buffer)
+                    audio_buffer.clear()
+                    last_process_time = time.time()
+                    
+                    # Process the audio
+                    is_processing = True
+                    asyncio.create_task(
+                        process_and_respond(websocket, stream_sid, audio_data, seq_num)
+                        .add_done_callback(lambda _: setattr(__builtins__, "is_processing", False))
+                    )
                 continue
-
+            
+            except WebSocketDisconnect:
+                logger.info("WebSocket disconnected by client")
+                break
+                
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
-        # Cancel any ongoing processing
-        if processing_task and not processing_task.done():
-            processing_task.cancel()
-            
         # Clean close
         try:
             if websocket.application_state == WebSocketState.CONNECTED:
@@ -385,6 +362,113 @@ async def ws_exotel(websocket: WebSocket):
             logger.info("WebSocket closed gracefully")
         except Exception as e:
             logger.warning(f"Error closing WebSocket: {e}")
+
+async def process_and_respond(websocket, stream_sid, audio_data, start_seq_num):
+    """Process audio data and send response"""
+    seq_num = start_seq_num
+    
+    try:
+        # First send a "thinking" mark to keep the connection active
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await safe_send_json(websocket, {
+                "event": "mark",
+                "sequence_number": seq_num,
+                "stream_sid": stream_sid,
+                "mark": {"name": "thinking"}
+            })
+            seq_num += 1
+        
+        # Transcribe the audio
+        transcript = await transcribe_pcm(audio_data)
+        if not transcript:
+            logger.warning("No transcript detected")
+            return seq_num
+        
+        # Get LLM response
+        reply = await llm_respond(transcript)
+        
+        # Convert response to audio
+        pcm_reply = await text_to_pcm(reply)
+        
+        # Send the audio response in chunks
+        if websocket.application_state == WebSocketState.CONNECTED:
+            chunks = chunk_pcm(pcm_reply)
+            timestamp = str(int(time.time() * 1000))
+            
+            # Send each chunk of the response
+            for idx, chunk in enumerate(chunks, 1):
+                # Verify connection before each send
+                if websocket.application_state != WebSocketState.CONNECTED:
+                    logger.warning("WebSocket disconnected during sending")
+                    break
+                
+                try:
+                    await websocket.send_json({
+                        "event": "media",
+                        "sequence_number": seq_num,
+                        "stream_sid": stream_sid,
+                        "media": {
+                            "chunk": idx,
+                            "timestamp": timestamp,
+                            "payload": base64.b64encode(chunk).decode()
+                        }
+                    })
+                    seq_num += 1
+                    
+                    # Wait between chunks to avoid overwhelming Exotel
+                    # This is critical according to their documentation
+                    await asyncio.sleep(0.02)  # 20ms delay
+                    
+                except Exception as e:
+                    logger.error(f"Error sending audio chunk: {e}")
+                    break
+            
+            # Send a mark to signal the end of response
+            if websocket.application_state == WebSocketState.CONNECTED:
+                await safe_send_json(websocket, {
+                    "event": "mark",
+                    "sequence_number": seq_num,
+                    "stream_sid": stream_sid,
+                    "mark": {"name": "response-complete"}
+                })
+                seq_num += 1
+        
+    except Exception as e:
+        logger.error(f"Error processing audio: {e}", exc_info=True)
+        
+        # Try to send error message if possible
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try:
+                error_text = "ക്ഷമിക്കണം, എന്തോ തകരാറുണ്ടായി. വീണ്ടും ശ്രമിക്കാമോ?"
+                error_pcm = await text_to_pcm(error_text)
+                chunks = chunk_pcm(error_pcm)
+                
+                timestamp = str(int(time.time() * 1000))
+                for idx, chunk in enumerate(chunks, 1):
+                    await websocket.send_json({
+                        "event": "media",
+                        "sequence_number": seq_num,
+                        "stream_sid": stream_sid,
+                        "media": {
+                            "chunk": idx,
+                            "timestamp": timestamp,
+                            "payload": base64.b64encode(chunk).decode()
+                        }
+                    })
+                    seq_num += 1
+                    await asyncio.sleep(0.02)  # 20ms delay
+                
+                await websocket.send_json({
+                    "event": "mark",
+                    "sequence_number": seq_num,
+                    "stream_sid": stream_sid,
+                    "mark": {"name": "error-message-complete"}
+                })
+                seq_num += 1
+            except Exception:
+                logger.error("Failed to send error message")
+    
+    return seq_num
 
 # Health endpoint
 @app.get("/health")
