@@ -79,11 +79,15 @@ history = [{
 # -- Utility functions --
 # Utility functions for audio processing and AI interactions
 def is_silence(audio_bytes: bytes) -> bool:
-    
+    if not audio_bytes:
+        return True
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-    rms = np.sqrt(np.mean(audio_np ** 2))
+    if len(audio_np) == 0:
+        return True
+    rms = np.sqrt(np.mean(audio_np.astype(np.float64) ** 2))
     logger.debug(f"RMS: {rms}")
     return rms < SILENCE_THRESHOLD
+
 
 
 def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
@@ -229,8 +233,12 @@ async def ws_exotel(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        await websocket.close()
-        logger.info("WebSocket closed")
+        try:
+            await websocket.close()
+            logger.info("WebSocket closed gracefully")
+        except RuntimeError as e:
+            logger.warning(f"WebSocket already closed: {e}")
+
 
 if __name__ == "__main__":
     
