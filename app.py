@@ -1,3 +1,11 @@
+import os
+import time
+import base64
+import uuid
+import wave
+import asyncio
+import numpy as np
+import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.responses import JSONResponse
@@ -6,14 +14,8 @@ from sarvamai import SarvamAI
 from groq import Groq
 import uvicorn
 from starlette.websockets import WebSocketState
-import os
-import uuid
-import base64
-import time
-import wave
-import logging
-import asyncio
-import numpy as np
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -57,10 +59,28 @@ async def health_check():
 # History for the LLM (system prompt)
 history = [{
     "role": "system",
-    "content": """... trimmed for brevity ..."""
+    "content": """
+നീ മലയാളത്തിൽ സംസാരിക്കുന്ന ഒരു വോയ്സ് കോളിന്റെ അസിസ്റ്റന്റാണ്. താങ്കളുടെ ജോലി വയനാട്ടിലെ വൈത്തിരി പാർക്കിന്റെ സന്ദർശകരുമായി സൗഹൃദപരമായ രീതിയിൽ സംസാരിക്കുകയും, അവരുടെ സംശയങ്ങൾക്കും ചോദ്യങ്ങൾക്കും വ്യക്തമായ മറുപടികൾ നൽകുകയും ചെയ്യുകയാണ്. താങ്കൾക്ക് എല്ലാവിധ മറുപടികളും ത്യാജ്യരീതിയിൽ, വിനീതതയോടെ നൽകേണ്ടതാണ്.
+
+വൈത്തിരി പാർക്ക് വയനാട്ടിലെ വൈത്തിരിയിലാണ് സ്ഥിതി ചെയ്യുന്നത്. മനോഹരമായ മലനിരകൾ, പച്ചക്കാടുകൾ, മഞ്ഞുമൂടിയ കാലാവസ്ഥ തുടങ്ങിയ പ്രകൃതിദൃശ്യങ്ങൾക്കിടയിൽ സ്ഥിതി ചെയ്യുന്ന ഈ പാർക്ക് സാഹസിക വിനോദത്തിനും കുടുംബസമേതം സമയം ചെലവിടുന്നതിനും അനുയോജ്യമായ സ്ഥലമാണ്.
+
+ഈ പാർക്കിൽ 40-ലധികം റൈഡുകൾ ലഭ്യമാണ്. അതിൽ അഡ്വഞ്ചർ റൈഡുകളും, അമ്യൂസ്മെന്റ് റൈഡുകളും, വാട്ടർ സ്ലൈഡുകളും ഉൾപ്പെടുന്നു. എല്ലാ പ്രായമുള്ള ആളുകൾക്കും അനുയോജ്യമായ രീതിയിലാണ് ആമസ്മെന്റ് ഒരുക്കങ്ങൾ രൂപകൽപ്പന ചെയ്തിരിക്കുന്നത്.
+
+വൈത്തിരി പാർക്ക് ഓരോ ദിവസവും രാവിലെ 9 മണി മുതൽ വൈകിട്ട് 6 മണി വരെ തുറന്നിരിക്കുന്നു.
+
+ടിക്കറ്റ് നിരക്കുകൾ ചുവടെ കാണാം:
+- മുതിർന്നവർക്ക് ₹799 രൂപയാണ്.
+- കുട്ടികൾക്ക് (ഉയരം 90 സെ.മി. മുതൽ 120 സെ.മി. വരെ) ₹599 രൂപയാണ്.
+- മുതിർന്ന പൗരന്മാർക്ക് ₹300 രൂപയാണ്.
+
+ഒരു സന്ദർശകനായി താങ്കൾ എന്തെങ്കിലും സംശയങ്ങൾ ഉന്നയിച്ചാൽ അതിന് ചുരുങ്ങിയതും വ്യക്തവുമായ മറുപടി നൽകേണ്ടതുണ്ട്. കൂടുതൽ വിശദീകരണം ആവശ്യമെങ്കിൽ, "കൂടുതൽ വിവരങ്ങൾക്ക് ഞങ്ങളുടെ സെൽസ് എക്സിക്യൂട്ടീവുമായി ബന്ധപ്പെടാമോ?" എന്ന് അകൃത്യമായും വിനീതമായും ചോദിക്കുക.
+
+താങ്കളുടെ മറുപടികൾ എല്ലാം മലയാളത്തിലായിരിക്കണം. സന്ദർശകർക്ക് സഹായകരമായ ഉത്തരം നൽകാൻ ഉദ്ദേശിച്ചുകൊണ്ട് ചുരുങ്ങിയ വാക്കുകളിൽ സൗമ്യമായി പ്രതികരിക്കുക.
+"""
 }]
 
-# Utility functions
+# -- Utility functions --
+# Utility functions for audio processing and AI interactions
 def is_silence(audio_bytes: bytes) -> bool:
     if not audio_bytes:
         return True
@@ -71,6 +91,8 @@ def is_silence(audio_bytes: bytes) -> bool:
     logger.debug(f"RMS: {rms}")
     return rms < SILENCE_THRESHOLD
 
+
+
 def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
     logger.debug(f"Writing PCM to WAV: {wav_path}")
     with wave.open(wav_path, 'wb') as wf:
@@ -78,6 +100,7 @@ def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
         wf.setsampwidth(SAMPLE_WIDTH)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(pcm_data)
+
 
 def transcribe_pcm(pcm_data: bytes) -> str:
     temp_file = f"temp_{uuid.uuid4().hex}.wav"
@@ -94,6 +117,7 @@ def transcribe_pcm(pcm_data: bytes) -> str:
     logger.info(f"Transcript: {transcript}")
     return transcript
 
+
 def llm_respond(transcript: str) -> str:
     logger.info(f"LLM received: {transcript}")
     history.append({"role": "user", "content": transcript})
@@ -109,6 +133,7 @@ def llm_respond(transcript: str) -> str:
     history.append({"role": "assistant", "content": reply})
     return reply
 
+
 def text_to_pcm(text: str) -> bytes:
     logger.info("Converting text to PCM via TTS")
     resp = sarvam_client.text_to_speech.convert(
@@ -122,28 +147,35 @@ def text_to_pcm(text: str) -> bytes:
     logger.debug(f"Generated PCM length: {len(pcm)}")
     return pcm
 
+
 def chunk_pcm(pcm_data: bytes, min_size=3200, max_size=100000, alignment=320):
     i = 0
     while i < len(pcm_data):
         end = min(i + max_size, len(pcm_data))
         chunk = pcm_data[i:end]
+
+        # Enforce alignment by trimming excess
         trim = len(chunk) % alignment
         if trim:
             chunk = chunk[:-trim]
+
+        # Enforce min size
         if len(chunk) < min_size:
-            break
+            break  # Don’t send too small
+
         yield chunk
         i += len(chunk)
 
+
+# -- WebSocket endpoint --
 @app.websocket("/ws")
 async def ws_exotel(websocket: WebSocket):
     await websocket.accept()
     stream_sid = None
     audio_buffer = deque()
     silence_start = None
-    last_silence_chunk_sent = time.time()
-    last_keepalive = time.time()
     seq_num = 1
+
     logger.info("WebSocket connection accepted")
 
     try:
@@ -182,6 +214,7 @@ async def ws_exotel(websocket: WebSocket):
 
                         reply = llm_respond(transcript)
 
+                        # Send keep-alive "thinking" mark
                         if websocket.application_state == WebSocketState.CONNECTED:
                             await websocket.send_json({
                                 "event": "mark",
@@ -192,6 +225,7 @@ async def ws_exotel(websocket: WebSocket):
                             logger.debug(f"Sent keep-alive mark event, seq={seq_num}")
                             seq_num += 1
 
+                        # Run TTS in a separate thread to avoid blocking
                         try:
                             pcm_reply = await asyncio.to_thread(text_to_pcm, reply)
                         except Exception as e:
@@ -200,6 +234,7 @@ async def ws_exotel(websocket: WebSocket):
 
                         timestamp = str(int(time.time() * 1000))
                         chunk_idx = 1
+
                         chunk_sent = False
                         for chunk in chunk_pcm(pcm_reply):
                             payload_b64 = base64.b64encode(chunk).decode()
@@ -217,7 +252,7 @@ async def ws_exotel(websocket: WebSocket):
                             seq_num += 1
                             chunk_idx += 1
                             chunk_sent = True
-                            await asyncio.sleep(0.1)
+                            await asyncio.sleep(0.1)  # Exotel expects ~100ms gaps
 
                         if chunk_sent:
                             await websocket.send_json({
@@ -228,38 +263,20 @@ async def ws_exotel(websocket: WebSocket):
                             })
                             logger.info(f"Sent mark event, seq={seq_num}")
                             seq_num += 1
-                else:
-                    silence_start = None
+                        else:
+                            logger.warning("TTS reply was too short to send valid chunks")
 
-                # Send silence chunk if prolonged silence
-                if time.time() - silence_start > 2.0 and (time.time() - last_silence_chunk_sent > 2.0):
-                    silence_chunk = b"\x00" * 3200
-                    payload_b64 = base64.b64encode(silence_chunk).decode()
-                    await websocket.send_json({
-                        "event": "media",
-                        "sequence_number": seq_num,
-                        "stream_sid": stream_sid,
-                        "media": {
-                            "chunk": 999,
-                            "timestamp": str(int(time.time() * 1000)),
-                            "payload": payload_b64
-                        }
-                    })
-                    logger.debug(f"Sent keep-alive silence chunk, seq={seq_num}")
-                    seq_num += 1
-                    last_silence_chunk_sent = time.time()
 
-                # Heartbeat mark event every 5 seconds
-                if time.time() - last_keepalive > 5.0:
-                    await websocket.send_json({
-                        "event": "mark",
-                        "sequence_number": seq_num,
-                        "stream_sid": stream_sid,
-                        "mark": {"name": "keep-alive"}
-                    })
-                    logger.debug(f"Sent keep-alive mark, seq={seq_num}")
-                    seq_num += 1
-                    last_keepalive = time.time()
+                        # Send end-of-reply mark
+                        if websocket.application_state == WebSocketState.CONNECTED:
+                            await websocket.send_json({
+                                "event": "mark",
+                                "sequence_number": seq_num,
+                                "stream_sid": stream_sid,
+                                "mark": {"name": "end-of-reply"}
+                            })
+                            logger.info(f"Sent mark event, seq={seq_num}")
+                            seq_num += 1
 
             if event == "stop":
                 logger.info("Stop event received; closing connection")
@@ -268,7 +285,14 @@ async def ws_exotel(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        logger.info("WebSocket ended.")
+        try:
+            await websocket.close()
+            logger.info("WebSocket closed gracefully")
+        except RuntimeError as e:
+            logger.warning(f"WebSocket already closed: {e}")
+
 
 if __name__ == "__main__":
+    
     uvicorn.run(app, host="0.0.0.0", port=10000)
+
