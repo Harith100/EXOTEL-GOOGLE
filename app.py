@@ -199,6 +199,10 @@ async def safe_send_json(websocket, data):
         logger.error(f"Error sending data over websocket: {e}")
         return False
 
+async def process_done_callback(is_processing):
+    """Callback function to reset processing state"""
+    is_processing = False
+
 # -- WebSocket endpoint --
 @app.websocket("/ws")
 async def ws_exotel(websocket: WebSocket):
@@ -211,7 +215,6 @@ async def ws_exotel(websocket: WebSocket):
     welcome_sent = False
     is_processing = False
     media_sent = False
-    processing_lock = asyncio.Lock()
 
     logger.info("WebSocket connection accepted")
 
@@ -314,10 +317,17 @@ async def ws_exotel(websocket: WebSocket):
                         
                         # Process the audio
                         is_processing = True
-                        asyncio.create_task(
+                        # Use proper task scheduling and await the coroutine
+                        task = asyncio.create_task(
                             process_and_respond(websocket, stream_sid, audio_data, seq_num)
-                            .add_done_callback(lambda _: setattr(__builtins__, "is_processing", False))
                         )
+                        
+                        # Set up proper callback to reset the is_processing flag
+                        def reset_processing_flag(future):
+                            nonlocal is_processing
+                            is_processing = False
+                        
+                        task.add_done_callback(reset_processing_flag)
 
                 elif event == "mark":
                     # Handle mark events from Exotel (e.g., audio processing completion)
@@ -342,10 +352,17 @@ async def ws_exotel(websocket: WebSocket):
                     
                     # Process the audio
                     is_processing = True
-                    asyncio.create_task(
+                    # Use proper task scheduling and await the coroutine
+                    task = asyncio.create_task(
                         process_and_respond(websocket, stream_sid, audio_data, seq_num)
-                        .add_done_callback(lambda _: setattr(__builtins__, "is_processing", False))
                     )
+                    
+                    # Set up proper callback to reset the is_processing flag
+                    def reset_processing_flag(future):
+                        nonlocal is_processing
+                        is_processing = False
+                    
+                    task.add_done_callback(reset_processing_flag)
                 continue
             
             except WebSocketDisconnect:
