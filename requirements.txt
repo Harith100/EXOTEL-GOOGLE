@@ -1,6 +1,6 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-sarvamai==1.2.0
+sarvamai==0.1.10
 groq==0.5.0
 python-dotenv==1.0.1
 numpy==1.26.4
