@@ -13,7 +13,8 @@ from fastapi.responses import JSONResponse
 from collections import deque
 from sarvamai import SarvamAI
 from groq import Groq
-from pydub import AudioSegment
+import tempfile
+import wave
 
 # Configure logging
 logging.basicConfig(
@@ -106,6 +107,7 @@ def llm_respond(transcript: str) -> str:
     history.append({"role": "assistant", "content": reply})
     return reply
 
+
 def text_to_pcm_wav(text: str) -> bytes:
     logger.info("Converting text to WAV via TTS")
     resp = sarvam_client.text_to_speech.convert(
@@ -113,17 +115,24 @@ def text_to_pcm_wav(text: str) -> bytes:
         target_language_code="ml-IN",
         speaker="manisha",
         enable_preprocessing=True,
-        output_format="wav"
+        speech_sample_rate=SAMPLE_RATE,
+        audio_format="wav"  # correct param
     )
     wav_bytes = b"".join(base64.b64decode(chunk) for chunk in resp.audios)
     return wav_bytes
 
+
 def wav_to_pcm_chunks(wav_bytes: bytes, chunk_size: int = CHUNK_MIN_SIZE):
-    audio = AudioSegment.from_file(io.BytesIO(wav_bytes), format="wav")
-    audio = audio.set_channels(CHANNELS).set_sample_width(SAMPLE_WIDTH).set_frame_rate(SAMPLE_RATE)
-    pcm_io = io.BytesIO()
-    audio.export(pcm_io, format="raw")
-    pcm_bytes = pcm_io.getvalue()
+    logger.info("Converting WAV to raw PCM chunks without pydub")
+
+    with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
+        assert wf.getframerate() == SAMPLE_RATE
+        assert wf.getsampwidth() == SAMPLE_WIDTH
+        assert wf.getnchannels() == CHANNELS
+
+        pcm_bytes = wf.readframes(wf.getnframes())
+
+    # Yield chunks aligned to 320 bytes
     for i in range(0, len(pcm_bytes), chunk_size):
         chunk = pcm_bytes[i:i + chunk_size]
         if len(chunk) % CHUNK_ALIGNMENT != 0:
@@ -133,7 +142,6 @@ def wav_to_pcm_chunks(wav_bytes: bytes, chunk_size: int = CHUNK_MIN_SIZE):
 def text_to_exotel_pcm_chunks(text: str):
     wav_bytes = text_to_pcm_wav(text)
     return wav_to_pcm_chunks(wav_bytes)
-
 # ---------------- WebSocket ----------------
 
 @app.websocket("/ws")
