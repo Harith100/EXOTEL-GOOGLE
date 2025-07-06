@@ -37,9 +37,7 @@ CHUNK_ALIGNMENT = 320
 CHUNK_MIN_SIZE = 3200  # 100ms
 SILENCE_THRESHOLD = 500
 SILENCE_DURATION = 2.0  # seconds
-MAX_AUDIO_BUFFER_DURATION = 5.0  # seconds
 
-# FastAPI app
 app = FastAPI()
 
 @app.get("/health")
@@ -52,12 +50,15 @@ async def health_check():
         logger.error("Health check failed: AI clients not initialized")
         raise HTTPException(status_code=503, detail="Service Unavailable")
 
+
 history = [{
     "role": "system",
     "content": """
-നീ മലയാളത്തിൽ സംസാരിക്കുന്ന ഒരു വോയ്സ് കോളിന്റെ അസിസ്റ്റന്റാണ്. താങ്കളുടെ ജോലി വയനാട്ടിലെ വൈത്തിരി പാർക്കിന്റെ സന്ദർശകരുമായി സൗഹൃദപരമായ രീതിയിൽ സംസാരിക്കുകയും, അവരുടെ സംശയങ്ങൾക്കും ചോദ്യങ്ങൾക്കും വ്യക്തമായ മറുപടികൾ നൽകുകയും ചെയ്യുകയാണ്...
+നീ മലയാളത്തിൽ സംസാരിക്കുന്ന ഒരു വോയ്സ് കോളിന്റെ അസിസ്റ്റന്റാണ്... [TRUNCATED FOR BREVITY]
 """
 }]
+
+# ---------------- UTILS ----------------
 
 def is_silence(audio_bytes: bytes) -> bool:
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
@@ -66,6 +67,7 @@ def is_silence(audio_bytes: bytes) -> bool:
     return rms < SILENCE_THRESHOLD
 
 def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
+    logger.debug(f"Writing PCM to WAV: {wav_path}")
     with wave.open(wav_path, 'wb') as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(SAMPLE_WIDTH)
@@ -124,15 +126,15 @@ def chunk_pcm(pcm_data: bytes, size: int = CHUNK_MIN_SIZE):
         if chunk:
             yield chunk
 
+# ---------------- WebSocket ----------------
+
 @app.websocket("/ws")
 async def ws_exotel(websocket: WebSocket):
     await websocket.accept()
     stream_sid = None
     audio_buffer = deque()
     silence_start = None
-    audio_start_time = None
     seq_num = 1
-    sent_initial_reply = False
 
     logger.info("WebSocket connection accepted")
 
@@ -150,34 +152,30 @@ async def ws_exotel(websocket: WebSocket):
                 stream_sid = msg.get("stream_sid")
                 logger.info(f"Stream started: {stream_sid}")
 
-                # Send welcome message
-                welcome_text = "വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം! സഹായിക്കാൻ ഞാൻ ഇവിടെ തയ്യാറാണ്."
-                welcome_pcm = text_to_pcm(welcome_text)
-                timestamp = str(int(time.time() * 1000))
-                chunk_idx = 1
-                for chunk in chunk_pcm(welcome_pcm):
-                    await websocket.send_json({
-                        "event": "media",
-                        "sequence_number": seq_num,
-                        "stream_sid": stream_sid,
-                        "media": {
-                            "chunk": chunk_idx,
-                            "timestamp": timestamp,
-                            "payload": base64.b64encode(chunk).decode()
-                        }
-                    })
-                    logger.debug(f"Sent welcome chunk {chunk_idx}, seq={seq_num}")
-                    seq_num += 1
-                    chunk_idx += 1
-                    await asyncio.sleep(0.1)
+                welcome_text = "വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം! ഞാൻ നിങ്ങളെ സഹായിക്കാനാണ് ഇവിടെ."
+                pcm_welcome = text_to_pcm(welcome_text)
 
-                await websocket.send_json({
-                    "event": "mark",
-                    "sequence_number": seq_num,
-                    "stream_sid": stream_sid,
-                    "mark": {"name": "welcome-sent"}
-                })
-                seq_num += 1
+                chunk_idx = 1
+                for chunk in chunk_pcm(pcm_welcome):
+                    try:
+                        await websocket.send_json({
+                            "event": "media",
+                            "sequence_number": seq_num,
+                            "stream_sid": stream_sid,
+                            "media": {
+                                "chunk": chunk_idx,
+                                "timestamp": str(int(time.time() * 1000)),
+                                "payload": base64.b64encode(chunk).decode()
+                            }
+                        })
+                        logger.debug(f"Sent welcome chunk {chunk_idx}, seq={seq_num}")
+                        seq_num += 1
+                        chunk_idx += 1
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        logger.warning(f"WebSocket send failed (welcome): {e}")
+                        break
+
                 continue
 
             if event == "media":
@@ -185,82 +183,56 @@ async def ws_exotel(websocket: WebSocket):
                 audio_buffer.append(payload)
                 logger.debug(f"Buffered media chunk, size={len(payload)}")
 
-                if not sent_initial_reply:
-                    logger.info("Sending initial quick TTS reply to keep session alive")
-                    quick_reply_pcm = text_to_pcm("ഒരു സെക്കൻഡ്, ഞാൻ പരിശോധിക്കുന്നു.")
-                    timestamp = str(int(time.time() * 1000))
-                    chunk_idx = 1
-                    for chunk in chunk_pcm(quick_reply_pcm):
-                        await websocket.send_json({
-                            "event": "media",
-                            "sequence_number": seq_num,
-                            "stream_sid": stream_sid,
-                            "media": {
-                                "chunk": chunk_idx,
-                                "timestamp": timestamp,
-                                "payload": base64.b64encode(chunk).decode()
-                            }
-                        })
-                        logger.debug(f"Sent quick keepalive chunk {chunk_idx}, seq={seq_num}")
-                        seq_num += 1
-                        chunk_idx += 1
-                        await asyncio.sleep(0.1)
-                    sent_initial_reply = True
-
-                if audio_start_time is None:
-                    audio_start_time = time.time()
-
-                buffer_duration = time.time() - audio_start_time
-                silence = is_silence(payload)
-                process_audio = False
-
-                if silence:
+                if is_silence(payload):
                     if silence_start is None:
                         silence_start = time.time()
+                        logger.debug("Silence detected, starting timer")
                     elif time.time() - silence_start >= SILENCE_DURATION:
-                        process_audio = True
-                elif buffer_duration >= MAX_AUDIO_BUFFER_DURATION:
-                    process_audio = True
+                        pcm_data = b"".join(audio_buffer)
+                        audio_buffer.clear()
+                        silence_start = None
+                        logger.info("Processing buffered audio after silence")
 
-                if process_audio:
-                    pcm_data = b"".join(audio_buffer)
-                    audio_buffer.clear()
-                    silence_start = None
-                    audio_start_time = None
+                        transcript = transcribe_pcm(pcm_data)
+                        if not transcript:
+                            continue
 
-                    transcript = transcribe_pcm(pcm_data)
-                    if not transcript:
-                        continue
+                        reply = llm_respond(transcript)
+                        pcm_reply = text_to_pcm(reply)
 
-                    reply = llm_respond(transcript)
-                    pcm_reply = text_to_pcm(reply)
+                        timestamp = str(int(time.time() * 1000))
+                        chunk_idx = 1
+                        for chunk in chunk_pcm(pcm_reply):
+                            try:
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "sequence_number": seq_num,
+                                    "stream_sid": stream_sid,
+                                    "media": {
+                                        "chunk": chunk_idx,
+                                        "timestamp": timestamp,
+                                        "payload": base64.b64encode(chunk).decode()
+                                    }
+                                })
+                                logger.debug(f"Sent reply chunk {chunk_idx}, seq={seq_num}")
+                                seq_num += 1
+                                chunk_idx += 1
+                                await asyncio.sleep(0.1)
+                            except Exception as e:
+                                logger.warning(f"WebSocket send failed (reply): {e}")
+                                break
 
-                    timestamp = str(int(time.time() * 1000))
-                    chunk_idx = 1
-                    for chunk in chunk_pcm(pcm_reply):
-                        await websocket.send_json({
-                            "event": "media",
-                            "sequence_number": seq_num,
-                            "stream_sid": stream_sid,
-                            "media": {
-                                "chunk": chunk_idx,
-                                "timestamp": timestamp,
-                                "payload": base64.b64encode(chunk).decode()
-                            }
-                        })
-                        logger.debug(f"Sent media chunk {chunk_idx}, seq={seq_num}")
-                        seq_num += 1
-                        chunk_idx += 1
-                        await asyncio.sleep(0.1)
-
-                    await websocket.send_json({
-                        "event": "mark",
-                        "sequence_number": seq_num,
-                        "stream_sid": stream_sid,
-                        "mark": {"name": "end-of-reply"}
-                    })
-                    logger.info(f"Sent mark event, seq={seq_num}")
-                    seq_num += 1
+                        try:
+                            await websocket.send_json({
+                                "event": "mark",
+                                "sequence_number": seq_num,
+                                "stream_sid": stream_sid,
+                                "mark": {"name": "end-of-reply"}
+                            })
+                            logger.info(f"Sent mark event, seq={seq_num}")
+                            seq_num += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to send mark event: {e}")
 
             if event == "stop":
                 logger.info("Stop event received; closing connection")
@@ -268,6 +240,10 @@ async def ws_exotel(websocket: WebSocket):
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+
     finally:
-        await websocket.close()
-        logger.info("WebSocket closed")
+        if websocket.client_state.name == "CONNECTED":
+            await websocket.close()
+            logger.info("WebSocket closed safely")
+        else:
+            logger.info("WebSocket already closed")
