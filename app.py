@@ -3,6 +3,7 @@ import time
 import base64
 import uuid
 import wave
+import io
 import asyncio
 import numpy as np
 import logging
@@ -12,6 +13,7 @@ from fastapi.responses import JSONResponse
 from collections import deque
 from sarvamai import SarvamAI
 from groq import Groq
+from pydub import AudioSegment
 
 # Configure logging
 logging.basicConfig(
@@ -54,7 +56,7 @@ async def health_check():
 history = [{
     "role": "system",
     "content": """
-നീ മലയാളത്തിൽ സംസാരിക്കുന്ന ഒരു വോയ്സ് കോളിന്റെ അസിസ്റ്റന്റാണ്... [TRUNCATED FOR BREVITY]
+നീ മലയാളത്തിൽ സംസാരിക്കുന്ന ഒരു വോയ്സ് കോളിന്റെ അസിസ്റ്റന്റാണ്. വിനീതമായി സംസാരിക്കണം, വ്യക്തതയോടെ മറുപടി പറയണം, സന്ദർശകർക്ക് വൈത്തിരി പാർക്കിനെ കുറിച്ച് സഹായിക്കണം.
 """
 }]
 
@@ -104,27 +106,33 @@ def llm_respond(transcript: str) -> str:
     history.append({"role": "assistant", "content": reply})
     return reply
 
-def text_to_pcm(text: str) -> bytes:
-    logger.info("Converting text to PCM via TTS")
+def text_to_pcm_wav(text: str) -> bytes:
+    logger.info("Converting text to WAV via TTS")
     resp = sarvam_client.text_to_speech.convert(
         text=text,
         target_language_code="ml-IN",
         speaker="manisha",
         enable_preprocessing=True,
-        speech_sample_rate=SAMPLE_RATE
+        output_format="wav"
     )
-    pcm = b"".join(base64.b64decode(chunk) for chunk in resp.audios)
-    logger.debug(f"Generated PCM length: {len(pcm)}")
-    return pcm
+    wav_bytes = b"".join(base64.b64decode(chunk) for chunk in resp.audios)
+    return wav_bytes
 
-def chunk_pcm(pcm_data: bytes, size: int = CHUNK_MIN_SIZE):
-    for i in range(0, len(pcm_data), size):
-        chunk = pcm_data[i:i+size]
-        trim = len(chunk) % CHUNK_ALIGNMENT
-        if trim:
-            chunk = chunk[:-trim]
-        if chunk:
-            yield chunk
+def wav_to_pcm_chunks(wav_bytes: bytes, chunk_size: int = CHUNK_MIN_SIZE):
+    audio = AudioSegment.from_file(io.BytesIO(wav_bytes), format="wav")
+    audio = audio.set_channels(CHANNELS).set_sample_width(SAMPLE_WIDTH).set_frame_rate(SAMPLE_RATE)
+    pcm_io = io.BytesIO()
+    audio.export(pcm_io, format="raw")
+    pcm_bytes = pcm_io.getvalue()
+    for i in range(0, len(pcm_bytes), chunk_size):
+        chunk = pcm_bytes[i:i + chunk_size]
+        if len(chunk) % CHUNK_ALIGNMENT != 0:
+            chunk += b'\x00' * (CHUNK_ALIGNMENT - len(chunk) % CHUNK_ALIGNMENT)
+        yield chunk
+
+def text_to_exotel_pcm_chunks(text: str):
+    wav_bytes = text_to_pcm_wav(text)
+    return wav_to_pcm_chunks(wav_bytes)
 
 # ---------------- WebSocket ----------------
 
@@ -153,29 +161,24 @@ async def ws_exotel(websocket: WebSocket):
                 logger.info(f"Stream started: {stream_sid}")
 
                 welcome_text = "വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം! ഞാൻ നിങ്ങളെ സഹായിക്കാനാണ് ഇവിടെ."
-                pcm_welcome = text_to_pcm(welcome_text)
-
-                chunk_idx = 1
-                for chunk in chunk_pcm(pcm_welcome):
+                for chunk in text_to_exotel_pcm_chunks(welcome_text):
                     try:
                         await websocket.send_json({
                             "event": "media",
                             "sequence_number": seq_num,
                             "stream_sid": stream_sid,
                             "media": {
-                                "chunk": chunk_idx,
+                                "chunk": seq_num,
                                 "timestamp": str(int(time.time() * 1000)),
                                 "payload": base64.b64encode(chunk).decode()
                             }
                         })
-                        logger.debug(f"Sent welcome chunk {chunk_idx}, seq={seq_num}")
+                        logger.debug(f"Sent welcome chunk, seq={seq_num}")
                         seq_num += 1
-                        chunk_idx += 1
                         await asyncio.sleep(0.1)
                     except Exception as e:
                         logger.warning(f"WebSocket send failed (welcome): {e}")
                         break
-
                 continue
 
             if event == "media":
@@ -198,25 +201,20 @@ async def ws_exotel(websocket: WebSocket):
                             continue
 
                         reply = llm_respond(transcript)
-                        pcm_reply = text_to_pcm(reply)
-
-                        timestamp = str(int(time.time() * 1000))
-                        chunk_idx = 1
-                        for chunk in chunk_pcm(pcm_reply):
+                        for chunk in text_to_exotel_pcm_chunks(reply):
                             try:
                                 await websocket.send_json({
                                     "event": "media",
                                     "sequence_number": seq_num,
                                     "stream_sid": stream_sid,
                                     "media": {
-                                        "chunk": chunk_idx,
-                                        "timestamp": timestamp,
+                                        "chunk": seq_num,
+                                        "timestamp": str(int(time.time() * 1000)),
                                         "payload": base64.b64encode(chunk).decode()
                                     }
                                 })
-                                logger.debug(f"Sent reply chunk {chunk_idx}, seq={seq_num}")
+                                logger.debug(f"Sent reply chunk, seq={seq_num}")
                                 seq_num += 1
-                                chunk_idx += 1
                                 await asyncio.sleep(0.1)
                             except Exception as e:
                                 logger.warning(f"WebSocket send failed (reply): {e}")
