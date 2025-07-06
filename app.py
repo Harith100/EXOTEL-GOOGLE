@@ -116,7 +116,7 @@ def text_to_pcm_wav(text: str) -> bytes:
         speaker="manisha",
         enable_preprocessing=True,
         speech_sample_rate=SAMPLE_RATE,
-        audio_format="wav"  # correct param
+        output_format="wav"  # correct param
     )
     wav_bytes = b"".join(base64.b64decode(chunk) for chunk in resp.audios)
     return wav_bytes
