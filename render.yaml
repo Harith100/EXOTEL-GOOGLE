@@ -1,13 +1,12 @@
 services:
   - type: web
-    name: vytiri-voicebot
+    name: exotel-voicebot
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port 10000"
     plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
     envVars:
-      - key: GROQ_API_KEY
-        sync: false
       - key: SARVAMAI_API_KEY
         sync: false
-
+      - key: GROQ_API_KEY
+        sync: false
