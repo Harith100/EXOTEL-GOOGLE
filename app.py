@@ -63,10 +63,25 @@ history = [{
 # ---------------- UTILS ----------------
 
 def is_silence(audio_bytes: bytes) -> bool:
-    audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-    rms = np.sqrt(np.mean(audio_np ** 2))
-    logger.debug(f"RMS: {rms}")
-    return rms < SILENCE_THRESHOLD
+    try:
+        audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+        if len(audio_np) == 0:
+            return True
+        
+        # Calculate RMS with overflow protection
+        mean_square = np.mean(audio_np.astype(np.float64) ** 2)
+        rms = np.sqrt(mean_square)
+        
+        # Handle NaN or invalid values
+        if np.isnan(rms) or np.isinf(rms):
+            logger.warning(f"Invalid RMS value: {rms}")
+            return False  # Don't treat as silence if we can't calculate properly
+        
+        logger.debug(f"RMS: {rms}")
+        return rms < SILENCE_THRESHOLD
+    except Exception as e:
+        logger.error(f"Error calculating RMS: {e}")
+        return False
 
 def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
     logger.debug(f"Writing PCM to WAV: {wav_path}")
@@ -239,7 +254,14 @@ async def ws_exotel(websocket: WebSocket):
                 welcome_text = "വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം! ഞാൻ നിങ്ങളെ സഹായിക്കാനാണ് ഇവിടെ."
                 try:
                     chunks = text_to_exotel_pcm_chunks(welcome_text)
-                    for chunk in chunks:
+                    logger.info(f"Sending {len(chunks)} welcome chunks")
+                    
+                    for i, chunk in enumerate(chunks):
+                        # Verify chunk is valid before sending
+                        if len(chunk) == 0:
+                            logger.warning(f"Empty chunk {i+1}, skipping")
+                            continue
+                            
                         await websocket.send_json({
                             "event": "media",
                             "sequence_number": seq_num,
@@ -250,12 +272,23 @@ async def ws_exotel(websocket: WebSocket):
                                 "payload": base64.b64encode(chunk).decode()
                             }
                         })
-                        logger.debug(f"Sent welcome chunk {seq_num}, size={len(chunk)}")
+                        logger.debug(f"Sent welcome chunk {seq_num} ({i+1}/{len(chunks)}), size={len(chunk)}")
                         seq_num += 1
                         # Small delay between chunks to prevent overwhelming
                         await asyncio.sleep(0.01)
+                    
+                    # Send a mark event after welcome message
+                    await websocket.send_json({
+                        "event": "mark",
+                        "sequence_number": seq_num,
+                        "stream_sid": stream_sid,
+                        "mark": {"name": "welcome-complete"}
+                    })
+                    logger.info(f"Welcome message complete, sent mark event")
+                    seq_num += 1
+                    
                 except Exception as e:
-                    logger.error(f"Error sending welcome message: {e}")
+                    logger.error(f"Error sending welcome message: {e}", exc_info=True)
                 continue
 
             if event == "media":
@@ -263,57 +296,64 @@ async def ws_exotel(websocket: WebSocket):
                 audio_buffer.append(payload)
                 logger.debug(f"Buffered media chunk, size={len(payload)}")
 
+                # Check if audio contains speech or is silence
                 if is_silence(payload):
                     if silence_start is None:
                         silence_start = time.time()
                         logger.debug("Silence detected, starting timer")
                     elif time.time() - silence_start >= SILENCE_DURATION:
-                        # Process buffered audio
-                        pcm_data = b"".join(audio_buffer)
-                        audio_buffer.clear()
-                        silence_start = None
-                        logger.info(f"Processing {len(pcm_data)} bytes of buffered audio after silence")
+                        # Process buffered audio only if we have enough data
+                        if len(audio_buffer) > 10:  # At least 10 chunks (1 second)
+                            pcm_data = b"".join(audio_buffer)
+                            audio_buffer.clear()
+                            silence_start = None
+                            logger.info(f"Processing {len(pcm_data)} bytes of buffered audio after silence")
 
-                        # Transcribe
-                        transcript = transcribe_pcm(pcm_data)
-                        if not transcript:
-                            logger.info("No transcript, continuing...")
-                            continue
+                            # Transcribe
+                            transcript = transcribe_pcm(pcm_data)
+                            if not transcript:
+                                logger.info("No transcript, continuing...")
+                                continue
 
-                        # Get LLM response
-                        reply = llm_respond(transcript)
-                        
-                        # Convert reply to PCM and send
-                        try:
-                            chunks = text_to_exotel_pcm_chunks(reply)
-                            for chunk in chunks:
+                            # Get LLM response
+                            reply = llm_respond(transcript)
+                            
+                            # Convert reply to PCM and send
+                            try:
+                                chunks = text_to_exotel_pcm_chunks(reply)
+                                for chunk in chunks:
+                                    await websocket.send_json({
+                                        "event": "media",
+                                        "sequence_number": seq_num,
+                                        "stream_sid": stream_sid,
+                                        "media": {
+                                            "chunk": seq_num,
+                                            "timestamp": str(int(time.time() * 1000)),
+                                            "payload": base64.b64encode(chunk).decode()
+                                        }
+                                    })
+                                    logger.debug(f"Sent reply chunk {seq_num}, size={len(chunk)}")
+                                    seq_num += 1
+                                    await asyncio.sleep(0.01)
+
+                                # Send mark event to indicate end of response
                                 await websocket.send_json({
-                                    "event": "media",
+                                    "event": "mark",
                                     "sequence_number": seq_num,
                                     "stream_sid": stream_sid,
-                                    "media": {
-                                        "chunk": seq_num,
-                                        "timestamp": str(int(time.time() * 1000)),
-                                        "payload": base64.b64encode(chunk).decode()
-                                    }
+                                    "mark": {"name": "end-of-reply"}
                                 })
-                                logger.debug(f"Sent reply chunk {seq_num}, size={len(chunk)}")
+                                logger.info(f"Sent mark event, seq={seq_num}")
                                 seq_num += 1
-                                await asyncio.sleep(0.01)
-
-                            # Send mark event to indicate end of response
-                            await websocket.send_json({
-                                "event": "mark",
-                                "sequence_number": seq_num,
-                                "stream_sid": stream_sid,
-                                "mark": {"name": "end-of-reply"}
-                            })
-                            logger.info(f"Sent mark event, seq={seq_num}")
-                            seq_num += 1
-                        except Exception as e:
-                            logger.error(f"Error sending reply: {e}")
+                            except Exception as e:
+                                logger.error(f"Error sending reply: {e}")
+                        else:
+                            # Reset silence timer if we don't have enough audio
+                            silence_start = time.time()
                 else:
                     # Reset silence timer if voice detected
+                    if silence_start is not None:
+                        logger.debug("Voice detected, resetting silence timer")
                     silence_start = None
 
             if event == "stop":
