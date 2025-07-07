@@ -120,13 +120,16 @@ def text_to_pcm_wav(text: str) -> bytes:
     """Convert text to WAV using Sarvam AI TTS"""
     logger.info("Converting text to WAV via TTS")
     try:
+        # Call Sarvam TTS API
         resp = sarvam_client.text_to_speech.convert(
             text=text,
             target_language_code="ml-IN",
-            speaker="manisha",
+            speaker="manisha",  # Female voice options: anushka, manisha, vidya, arya
             enable_preprocessing=True,
-            speech_sample_rate=SAMPLE_RATE,
-            output_format="wav"
+            speech_sample_rate=SAMPLE_RATE,  # 8000 Hz for Exotel
+            pace=1.0,  # Normal speed
+            pitch=0.0,  # Normal pitch
+            loudness=1.0  # Normal volume
         )
         
         # Debug logging
