@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse
 from collections import deque
 from sarvamai import SarvamAI
 from groq import Groq
+import io
+import wave
 
 # Configure logging
 logging.basicConfig(
@@ -135,7 +137,14 @@ def text_to_pcm(text: str) -> bytes:
         enable_preprocessing=True,
         speech_sample_rate=SAMPLE_RATE
     )
-    pcm = b"".join(base64.b64decode(chunk) for chunk in resp.audios)
+    pcm_chunks = []
+    for b64 in resp.audios:
+        wav_bytes = base64.b64decode(b64)
+        with wave.open(io.BytesIO(wav_bytes), 'rb') as wav_file:
+            frames = wav_file.readframes(wav_file.getnframes())
+            pcm_chunks.append(frames)
+
+    pcm = b"".join(pcm_chunks)
     #print first 100 bytes of PCM for debugging
     logger.debug(f"PCM out sample: {pcm[:100]}")
     logger.debug(f"Generated PCM length: {len(pcm)}")
