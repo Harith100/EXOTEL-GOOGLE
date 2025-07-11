@@ -5,3 +5,6 @@ ignore/app.py
 ignore/requirements.txt
 env310
 googlecred.json
+jsongooglecloud.json
+test.ipynb
+malayalam_tts_output.wav
