@@ -768,9 +768,7 @@ async def list_sessions():
             "end_time": data.get("end_time", "ongoing"),
             "conversation_count": len(data.get("conversations", []))
         })
-    return JSONResponse(content=sessions_summary)"] = "working"
-        except Exception as e:
-            results["sarvam_tts"] = f"error: {str(e)}"
+    return JSONResponse(content=sessions_summary)
     
 # Add endpoint to reload knowledge base
 @app.post("/reload-knowledge-base")
