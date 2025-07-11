@@ -135,7 +135,7 @@ def llm_respond(transcript: str) -> str:
     
     try:
         resp = groq_client.chat.completions.create(
-            model="llama-3.1-70b-versatile",  # Using a more stable model
+            model="llama3-70b-8192",  # Using a more stable model
             messages=history,
             temperature=0.5,
             max_tokens=150  # Keep responses concise
