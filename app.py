@@ -7,13 +7,13 @@ import asyncio
 import numpy as np
 import logging
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from collections import deque
 from sarvamai import SarvamAI
 from groq import Groq
 import io
-import wave
+import struct
 
 # Configure logging
 logging.basicConfig(
@@ -31,14 +31,14 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 sarvam_client = SarvamAI(api_subscription_key=SARVAMAI_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Audio configuration
+# Audio configuration - CRITICAL: Match Exotel's exact format
 SAMPLE_RATE = 8000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
-CHUNK_ALIGNMENT = 320
-CHUNK_MIN_SIZE = 3200  # 100ms
+CHUNK_SIZE = 1600  # 100ms at 8kHz = 800 samples * 2 bytes
 SILENCE_THRESHOLD = 500
 SILENCE_DURATION = 2.0  # seconds of silence to trigger processing
+SEND_INTERVAL = 0.02  # 20ms intervals for smoother playback
 
 # FastAPI app
 app = FastAPI()
@@ -78,9 +78,10 @@ history = [{
 }]
 
 # -- Utility functions --
-# Utility functions for audio processing and AI interactions
 def is_silence(audio_bytes: bytes) -> bool:
-    
+    """Check if audio chunk is silence"""
+    if len(audio_bytes) < 2:
+        return True
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
     rms = np.sqrt(np.mean(audio_np ** 2))
     logger.debug(f"RMS: {rms}")
@@ -88,7 +89,8 @@ def is_silence(audio_bytes: bytes) -> bool:
 
 
 def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
-    logger.debug(f"Writing PCM to WAV: {wav_path}")
+    """Convert PCM to WAV file"""
+    logger.debug(f"Writing PCM to WAV: {wav_path}, size: {len(pcm_data)}")
     with wave.open(wav_path, 'wb') as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(SAMPLE_WIDTH)
@@ -97,149 +99,271 @@ def pcm_to_wav(pcm_data: bytes, wav_path: str) -> None:
 
 
 def transcribe_pcm(pcm_data: bytes) -> str:
+    """Transcribe PCM audio using Sarvam AI"""
+    if len(pcm_data) < 1600:  # Skip if less than 100ms of audio
+        return ""
+    
     temp_file = f"temp_{uuid.uuid4().hex}.wav"
-    pcm_to_wav(pcm_data, temp_file)
-    logger.info("Starting transcription")
-    with open(temp_file, 'rb') as wf:
-        result = sarvam_client.speech_to_text.transcribe(
-            file=wf,
-            model="saarika:v2.5",
-            language_code="ml-IN"
-        )
-    os.remove(temp_file)
-    transcript = result.transcript.strip()
-    logger.info(f"Transcript: {transcript}")
-    return transcript
+    try:
+        pcm_to_wav(pcm_data, temp_file)
+        logger.info("Starting transcription")
+        with open(temp_file, 'rb') as wf:
+            result = sarvam_client.speech_to_text.transcribe(
+                file=wf,
+                model="saarika:v2.5",
+                language_code="ml-IN"
+            )
+        transcript = result.transcript.strip()
+        logger.info(f"Transcript: {transcript}")
+        return transcript
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        return ""
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
 
 def llm_respond(transcript: str) -> str:
+    """Generate response using Groq LLM"""
     logger.info(f"LLM received: {transcript}")
     history.append({"role": "user", "content": transcript})
+    
+    # Keep history manageable
     if len(history) > 20:
-        history[:] = history[-20:]
-    resp = groq_client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=history,
-        temperature=0.5
-    )
-    reply = resp.choices[0].message.content.strip()
-    logger.info(f"LLM reply: {reply}")
-    history.append({"role": "assistant", "content": reply})
-    return reply
+        history[:] = [history[0]] + history[-19:]  # Keep system prompt + last 19 messages
+    
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.1-70b-versatile",  # Using a more stable model
+            messages=history,
+            temperature=0.5,
+            max_tokens=150  # Keep responses concise
+        )
+        reply = resp.choices[0].message.content.strip()
+        logger.info(f"LLM reply: {reply}")
+        history.append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        return "മാപ്പുണ്ട്, എനിക്ക് ഇപ്പോൾ നിങ്ങളെ സഹായിക്കാൻ കഴിയുന്നില്ല."
 
 
 def text_to_pcm(text: str) -> bytes:
+    """Convert text to PCM using Sarvam TTS"""
     logger.info("Converting text to PCM via TTS")
-    resp = sarvam_client.text_to_speech.convert(
-        text=text,
-        target_language_code="ml-IN",
-        speaker="manisha",
-        enable_preprocessing=True,
-        speech_sample_rate=SAMPLE_RATE
-    )
-    pcm_chunks = []
-    for b64 in resp.audios:
-        wav_bytes = base64.b64decode(b64)
-        with wave.open(io.BytesIO(wav_bytes), 'rb') as wav_file:
-            frames = wav_file.readframes(wav_file.getnframes())
-            pcm_chunks.append(frames)
+    try:
+        resp = sarvam_client.text_to_speech.convert(
+            text=text,
+            target_language_code="ml-IN",
+            speaker="manisha",
+            enable_preprocessing=True,
+            speech_sample_rate=SAMPLE_RATE
+        )
+        
+        pcm_chunks = []
+        for b64 in resp.audios:
+            wav_bytes = base64.b64decode(b64)
+            # Extract PCM from WAV
+            with wave.open(io.BytesIO(wav_bytes), 'rb') as wav_file:
+                frames = wav_file.readframes(wav_file.getnframes())
+                pcm_chunks.append(frames)
+        
+        pcm = b"".join(pcm_chunks)
+        logger.debug(f"Generated PCM length: {len(pcm)}")
+        return pcm
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return b""
 
-    pcm = b"".join(pcm_chunks)
-    #print first 100 bytes of PCM for debugging
-    logger.debug(f"PCM out sample: {pcm[:100]}")
-    logger.debug(f"Generated PCM length: {len(pcm)}")
-    return pcm
 
+def ensure_linear_pcm(audio_data: bytes) -> bytes:
+    """Ensure audio is in correct Linear PCM format for Exotel"""
+    # If data length is odd, pad with a zero byte
+    if len(audio_data) % 2 != 0:
+        audio_data += b'\x00'
+    
+    # Verify it's valid 16-bit PCM by checking sample values
+    try:
+        samples = np.frombuffer(audio_data, dtype=np.int16)
+        # Ensure samples are in valid range
+        samples = np.clip(samples, -32768, 32767)
+        return samples.tobytes()
+    except Exception as e:
+        logger.error(f"PCM validation error: {e}")
+        return audio_data
 
-def chunk_pcm(pcm_data: bytes, size: int = CHUNK_MIN_SIZE):
-    for i in range(0, len(pcm_data), size):
-        chunk = pcm_data[i:i+size]
-        trim = len(chunk) % CHUNK_ALIGNMENT
-        if trim:
-            chunk = chunk[:-trim]
-        if chunk:
-            yield chunk
 
 # -- WebSocket endpoint --
-
 @app.websocket("/ws")
 async def ws_exotel(websocket: WebSocket):
     await websocket.accept()
+    
+    # Session variables
     stream_sid = None
-    audio_buffer = deque()
+    audio_buffer = bytearray()
     silence_start = None
     seq_num = 1
-
+    is_processing = False
+    connection_active = True
+    
     logger.info("WebSocket connection accepted")
-
+    
     try:
-        while True:
-            msg = await websocket.receive_json()
-            event = msg.get("event")
-            logger.debug(f"Received event: {event}")
-
-            if event == "connected":
-                logger.info("Connected event received")
-                continue
-
-            if event == "start":
-                stream_sid = msg.get("stream_sid")
-                logger.info(f"Stream started: {stream_sid}")
-                continue
-
-            if event == "media":
-                payload = base64.b64decode(msg["media"]["payload"])
-                audio_buffer.append(payload)
-                logger.debug(f"Buffered media chunk, size={len(payload)}")
-                # print first 100 bytes of payload for debugging
-                logger.debug(f"Payload sample: {payload[:100]}")
-
-                if is_silence(payload):
-                    if silence_start is None:
-                        silence_start = time.time()
-                        logger.debug("Silence detected, starting timer")
-                    elif time.time() - silence_start >= SILENCE_DURATION:
-                        pcm_data = b"".join(audio_buffer)
-                        audio_buffer.clear()
-                        silence_start = None
-                        logger.info("Processing buffered audio after silence")
-
-                        transcript = transcribe_pcm(pcm_data)
-                        if not transcript:
-                            continue
-
-                        reply = llm_respond(transcript)
-                        pcm_reply = text_to_pcm(reply)
-
-                        timestamp = str(int(time.time() * 1000))
-                        chunk_idx = 1
-                        for chunk in chunk_pcm(pcm_reply):
-                            await websocket.send_json({
-                                "event": "media",
-                                "sequence_number": seq_num,
-                                "stream_sid": stream_sid,
-                                "media": {"chunk": chunk_idx, "timestamp": timestamp, "payload": base64.b64encode(chunk).decode()}
-                            })
-                            logger.debug(f"Sent media chunk {chunk_idx}, seq={seq_num}")
-                            seq_num += 1
-                            chunk_idx += 1
-                            await asyncio.sleep(0.1)
-
-                        await websocket.send_json({
-                            "event": "mark",
-                            "sequence_number": seq_num,
-                            "stream_sid": stream_sid,
-                            "mark": {"name": "end-of-reply"}
-                        })
-                        logger.info(f"Sent mark event, seq={seq_num}")
-                        seq_num += 1
-
-            if event == "stop":
-                logger.info("Stop event received; closing connection")
+        while connection_active:
+            try:
+                # Set timeout for receive to handle disconnections gracefully
+                msg = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
+                event = msg.get("event")
+                logger.debug(f"Received event: {event}")
+                
+                if event == "connected":
+                    logger.info("Connected event received")
+                    # Send initial greeting after connection
+                    greeting = "നമസ്കാരം! വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം. ഞാൻ എങ്ങനെ സഹായിക്കാം?"
+                    initial_pcm = text_to_pcm(greeting)
+                    if initial_pcm and stream_sid:
+                        await send_audio_to_exotel(websocket, initial_pcm, stream_sid, seq_num)
+                        seq_num += len(initial_pcm) // CHUNK_SIZE + 1
+                    continue
+                
+                elif event == "start":
+                    stream_sid = msg.get("streamSid") or msg.get("stream_sid")
+                    logger.info(f"Stream started: {stream_sid}")
+                    
+                    # Send initial greeting
+                    greeting = "നമസ്കാരം! വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം. ഞാൻ എങ്ങനെ സഹായിക്കാം?"
+                    initial_pcm = text_to_pcm(greeting)
+                    if initial_pcm:
+                        await send_audio_to_exotel(websocket, initial_pcm, stream_sid, seq_num)
+                        seq_num += len(initial_pcm) // CHUNK_SIZE + 1
+                    continue
+                
+                elif event == "media":
+                    if is_processing:
+                        continue  # Skip incoming audio while processing
+                    
+                    # Decode audio payload
+                    payload = base64.b64decode(msg["media"]["payload"])
+                    audio_buffer.extend(payload)
+                    
+                    # Check for silence
+                    if is_silence(payload):
+                        if silence_start is None:
+                            silence_start = time.time()
+                            logger.debug("Silence detected, starting timer")
+                        elif time.time() - silence_start >= SILENCE_DURATION and len(audio_buffer) > 3200:
+                            # Process accumulated audio
+                            is_processing = True
+                            pcm_data = bytes(audio_buffer)
+                            audio_buffer.clear()
+                            silence_start = None
+                            
+                            logger.info(f"Processing buffered audio, size: {len(pcm_data)}")
+                            
+                            # Transcribe
+                            transcript = transcribe_pcm(pcm_data)
+                            if transcript:
+                                # Generate response
+                                reply = llm_respond(transcript)
+                                
+                                # Convert to speech
+                                pcm_reply = text_to_pcm(reply)
+                                if pcm_reply:
+                                    # Send audio response
+                                    await send_audio_to_exotel(websocket, pcm_reply, stream_sid, seq_num)
+                                    seq_num += len(pcm_reply) // CHUNK_SIZE + 1
+                            
+                            is_processing = False
+                    else:
+                        silence_start = None  # Reset silence timer on voice activity
+                
+                elif event == "stop":
+                    logger.info("Stop event received")
+                    connection_active = False
+                    break
+                
+                elif event == "clear":
+                    logger.info("Clear event received - resetting context")
+                    audio_buffer.clear()
+                    silence_start = None
+                    is_processing = False
+                    # Reset conversation history but keep system prompt
+                    history[:] = [history[0]]
+                
+            except asyncio.TimeoutError:
+                logger.warning("WebSocket receive timeout - connection may be idle")
+                # Send a keep-alive or check connection
+                try:
+                    await websocket.send_json({"event": "ping"})
+                except:
+                    connection_active = False
+                    break
+            except WebSocketDisconnect:
+                logger.info("WebSocket disconnected by client")
+                connection_active = False
                 break
-
+                
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
-        await websocket.close()
-        logger.info("WebSocket closed")
+        # Clean disconnect
+        try:
+            await websocket.close()
+        except:
+            pass
+        logger.info("WebSocket connection closed")
+
+
+async def send_audio_to_exotel(websocket: WebSocket, pcm_data: bytes, stream_sid: str, start_seq: int):
+    """Send PCM audio to Exotel in proper chunks"""
+    try:
+        # Ensure PCM is in correct format
+        pcm_data = ensure_linear_pcm(pcm_data)
+        
+        timestamp = str(int(time.time() * 1000))
+        seq = start_seq
+        
+        # Send audio in 100ms chunks (1600 bytes at 8kHz)
+        for i in range(0, len(pcm_data), CHUNK_SIZE):
+            chunk = pcm_data[i:i + CHUNK_SIZE]
+            
+            # Pad last chunk if needed
+            if len(chunk) < CHUNK_SIZE:
+                chunk = chunk + b'\x00' * (CHUNK_SIZE - len(chunk))
+            
+            # Encode to base64
+            payload = base64.b64encode(chunk).decode('utf-8')
+            
+            # Send media event
+            await websocket.send_json({
+                "event": "media",
+                "sequenceNumber": str(seq),
+                "streamSid": stream_sid,
+                "media": {
+                    "chunk": str((i // CHUNK_SIZE) + 1),
+                    "timestamp": timestamp,
+                    "payload": payload
+                }
+            })
+            
+            logger.debug(f"Sent chunk {(i // CHUNK_SIZE) + 1}, size: {len(chunk)}, seq: {seq}")
+            seq += 1
+            
+            # Small delay between chunks for smooth playback
+            await asyncio.sleep(SEND_INTERVAL)
+        
+        # Send mark event to indicate end of audio
+        await websocket.send_json({
+            "event": "mark",
+            "sequenceNumber": str(seq),
+            "streamSid": stream_sid,
+            "mark": {
+                "name": "end-of-audio"
+            }
+        })
+        
+        logger.info(f"Audio sent successfully, total chunks: {(len(pcm_data) // CHUNK_SIZE) + 1}")
+        
+    except Exception as e:
+        logger.error(f"Error sending audio: {e}", exc_info=True)
