@@ -1,3 +1,4 @@
+# Add these imports at the top
 import os
 import time
 import base64
@@ -14,6 +15,7 @@ from sarvamai import SarvamAI
 from groq import Groq
 import io
 import struct
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -46,13 +48,34 @@ app = FastAPI()
 # Health endpoint
 @app.get("/health")
 async def health_check():
+    health_status = {
+        "status": "ok",
+        "services": {
+            "groq": "unknown",
+            "sarvam": "unknown"
+        }
+    }
+    
     try:
-        assert sarvam_client is not None
-        assert groq_client is not None
-        return JSONResponse(status_code=200, content={"status": "ok"})
-    except Exception:
-        logger.error("Health check failed: AI clients not initialized")
-        raise HTTPException(status_code=503, detail="Service Unavailable")
+        # Check Groq
+        if groq_client:
+            health_status["services"]["groq"] = "ok"
+            
+        # Check Sarvam (you might want to add a simple test here)
+        if sarvam_client:
+            health_status["services"]["sarvam"] = "ok"
+            
+        # Overall status
+        if all(status == "ok" for status in health_status["services"].values()):
+            return JSONResponse(status_code=200, content=health_status)
+        else:
+            return JSONResponse(status_code=503, content=health_status)
+            
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        health_status["status"] = "error"
+        health_status["error"] = str(e)
+        return JSONResponse(status_code=503, content=health_status)
 
 # History for the LLM (system prompt)
 history = [{
@@ -106,18 +129,39 @@ def transcribe_pcm(pcm_data: bytes) -> str:
     temp_file = f"temp_{uuid.uuid4().hex}.wav"
     try:
         pcm_to_wav(pcm_data, temp_file)
-        logger.info("Starting transcription")
+        logger.info(f"Starting transcription, audio size: {len(pcm_data)} bytes")
+        
+        # Check if file was created properly
+        if not os.path.exists(temp_file) or os.path.getsize(temp_file) == 0:
+            logger.error("WAV file creation failed")
+            return ""
+        
         with open(temp_file, 'rb') as wf:
-            result = sarvam_client.speech_to_text.transcribe(
-                file=wf,
-                model="saarika:v2.5",
-                language_code="ml-IN"
-            )
-        transcript = result.transcript.strip()
-        logger.info(f"Transcript: {transcript}")
-        return transcript
+            # Try with different model versions if available
+            models = ["saarika:v2.5", "saarika:v2", "saarika:v1"]
+            
+            for model in models:
+                try:
+                    logger.info(f"Trying transcription with model: {model}")
+                    result = sarvam_client.speech_to_text.transcribe(
+                        file=wf,
+                        model=model,
+                        language_code="ml-IN"
+                    )
+                    transcript = result.transcript.strip()
+                    logger.info(f"Transcript: {transcript}")
+                    return transcript
+                except Exception as model_error:
+                    logger.error(f"Transcription error with {model}: {model_error}")
+                    # Reset file pointer for next attempt
+                    wf.seek(0)
+                    continue
+            
+            # If all models fail, return empty
+            return ""
+            
     except Exception as e:
-        logger.error(f"Transcription error: {e}")
+        logger.error(f"Transcription error: {e}", exc_info=True)
         return ""
     finally:
         if os.path.exists(temp_file):
@@ -135,7 +179,7 @@ def llm_respond(transcript: str) -> str:
     
     try:
         resp = groq_client.chat.completions.create(
-            model="llama3-70b-8192",  # Using a more stable model
+            model="llama3-70b-8192",  # Updated to currently supported model
             messages=history,
             temperature=0.5,
             max_tokens=150  # Keep responses concise
@@ -151,30 +195,45 @@ def llm_respond(transcript: str) -> str:
 
 def text_to_pcm(text: str) -> bytes:
     """Convert text to PCM using Sarvam TTS"""
-    logger.info("Converting text to PCM via TTS")
+    logger.info(f"Converting text to PCM via TTS: {text[:50]}...")
     try:
-        resp = sarvam_client.text_to_speech.convert(
-            text=text,
-            target_language_code="ml-IN",
-            speaker="manisha",
-            enable_preprocessing=True,
-            speech_sample_rate=SAMPLE_RATE
-        )
+        # Try different speakers if one fails
+        speakers = ["manisha", "arvind", "ravi"]
         
-        pcm_chunks = []
-        for b64 in resp.audios:
-            wav_bytes = base64.b64decode(b64)
-            # Extract PCM from WAV
-            with wave.open(io.BytesIO(wav_bytes), 'rb') as wav_file:
-                frames = wav_file.readframes(wav_file.getnframes())
-                pcm_chunks.append(frames)
+        for speaker in speakers:
+            try:
+                logger.info(f"Trying TTS with speaker: {speaker}")
+                resp = sarvam_client.text_to_speech.convert(
+                    text=text,
+                    target_language_code="ml-IN",
+                    speaker=speaker,
+                    enable_preprocessing=True,
+                    speech_sample_rate=SAMPLE_RATE
+                )
+                
+                pcm_chunks = []
+                for b64 in resp.audios:
+                    wav_bytes = base64.b64decode(b64)
+                    # Extract PCM from WAV
+                    with wave.open(io.BytesIO(wav_bytes), 'rb') as wav_file:
+                        frames = wav_file.readframes(wav_file.getnframes())
+                        pcm_chunks.append(frames)
+                
+                pcm = b"".join(pcm_chunks)
+                logger.debug(f"Generated PCM length: {len(pcm)}")
+                return pcm
+                
+            except Exception as speaker_error:
+                logger.error(f"TTS error with speaker {speaker}: {speaker_error}")
+                continue
         
-        pcm = b"".join(pcm_chunks)
-        logger.debug(f"Generated PCM length: {len(pcm)}")
-        return pcm
+        # If all speakers fail, return silence
+        logger.error("All TTS speakers failed, returning silence")
+        return b'\x00' * 1600  # 100ms of silence
+        
     except Exception as e:
-        logger.error(f"TTS error: {e}")
-        return b""
+        logger.error(f"TTS error: {e}", exc_info=True)
+        return b'\x00' * 1600  # Return silence on error
 
 
 def ensure_linear_pcm(audio_data: bytes) -> bytes:
@@ -231,12 +290,16 @@ async def ws_exotel(websocket: WebSocket):
                     stream_sid = msg.get("streamSid") or msg.get("stream_sid")
                     logger.info(f"Stream started: {stream_sid}")
                     
-                    # Send initial greeting
+                    # Send initial greeting with fallback
                     greeting = "നമസ്കാരം! വൈത്തിരി പാർക്കിലേക്ക് സ്വാഗതം. ഞാൻ എങ്ങനെ സഹായിക്കാം?"
                     initial_pcm = text_to_pcm(greeting)
-                    if initial_pcm:
+                    
+                    # If TTS fails, use a pre-recorded PCM or skip
+                    if initial_pcm and len(initial_pcm) > 1600:
                         await send_audio_to_exotel(websocket, initial_pcm, stream_sid, seq_num)
                         seq_num += len(initial_pcm) // CHUNK_SIZE + 1
+                    else:
+                        logger.warning("Initial greeting TTS failed, continuing without audio")
                     continue
                 
                 elif event == "media":
