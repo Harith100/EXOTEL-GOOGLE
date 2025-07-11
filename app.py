@@ -485,8 +485,11 @@ async def ws_exotel(websocket: WebSocket):
 async def send_audio_to_exotel(websocket: WebSocket, pcm_data: bytes, stream_sid: str, start_seq: int):
     """Send PCM audio to Exotel in proper chunks"""
     try:
-        # Check if websocket is still connected
-        if websocket.client_state != WebSocketState.CONNECTED:
+        # Simple connection check
+        try:
+            # Try to access websocket properties to check if it's still valid
+            _ = websocket.headers
+        except:
             logger.warning("WebSocket not connected, skipping audio send")
             return
             
@@ -498,11 +501,6 @@ async def send_audio_to_exotel(websocket: WebSocket, pcm_data: bytes, stream_sid
         
         # Send audio in 100ms chunks (1600 bytes at 8kHz)
         for i in range(0, len(pcm_data), CHUNK_SIZE):
-            # Check connection before each chunk
-            if websocket.client_state != WebSocketState.CONNECTED:
-                logger.warning("WebSocket disconnected during audio send")
-                break
-                
             chunk = pcm_data[i:i + CHUNK_SIZE]
             
             # Pad last chunk if needed
@@ -531,24 +529,23 @@ async def send_audio_to_exotel(websocket: WebSocket, pcm_data: bytes, stream_sid
                 # Small delay between chunks for smooth playback
                 await asyncio.sleep(SEND_INTERVAL)
                 
-            except (WebSocketDisconnect, RuntimeError) as e:
+            except (WebSocketDisconnect, RuntimeError, ConnectionError) as e:
                 logger.warning(f"WebSocket error during chunk send: {e}")
                 break
         
         # Send mark event if still connected
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.send_json({
-                    "event": "mark",
-                    "sequenceNumber": str(seq),
-                    "streamSid": stream_sid,
-                    "mark": {
-                        "name": "end-of-audio"
-                    }
-                })
-                logger.info(f"Audio sent successfully, total chunks: {(len(pcm_data) // CHUNK_SIZE) + 1}")
-            except:
-                pass
+        try:
+            await websocket.send_json({
+                "event": "mark",
+                "sequenceNumber": str(seq),
+                "streamSid": stream_sid,
+                "mark": {
+                    "name": "end-of-audio"
+                }
+            })
+            logger.info(f"Audio sent successfully, total chunks: {(len(pcm_data) // CHUNK_SIZE) + 1}")
+        except:
+            pass
         
     except Exception as e:
         logger.error(f"Error sending audio: {e}", exc_info=True)
