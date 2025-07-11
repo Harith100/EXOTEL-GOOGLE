@@ -136,6 +136,8 @@ def text_to_pcm(text: str) -> bytes:
         speech_sample_rate=SAMPLE_RATE
     )
     pcm = b"".join(base64.b64decode(chunk) for chunk in resp.audios)
+    #print first 100 bytes of PCM for debugging
+    logger.debug(f"PCM out sample: {pcm[:100]}")
     logger.debug(f"Generated PCM length: {len(pcm)}")
     return pcm
 
