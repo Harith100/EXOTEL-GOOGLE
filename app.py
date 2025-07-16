@@ -18,35 +18,31 @@ from datetime import datetime
 from google.cloud import texttospeech
 from google.oauth2 import service_account
 
-class GoogleTTS:
-    def __init__(self):
-        creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-        if not creds_json:
-            raise ValueError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON")
-        creds_dict = json.loads(creds_json)
-        credentials = service_account.Credentials.from_service_account_info(creds_dict)
-        self.client = texttospeech.TextToSpeechClient(credentials=credentials)
+creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if not creds_json:
+    raise ValueError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON")
+creds_dict = json.loads(creds_json)
+google_tts_client = texttospeech.TextToSpeechClient(
+    credentials=service_account.Credentials.from_service_account_info(creds_dict)
+)
 
-    def synthesize(self, text: str) -> bytes:
-        input_text = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="ml-IN",
-            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000,
-        )
-        response = self.client.synthesize_speech(
-            input=input_text,
-            voice=voice,
-            audio_config=audio_config,
-        )
-        with wave.open(io.BytesIO(response.audio_content), "rb") as wav_file:
-            frames = wav_file.readframes(wav_file.getnframes())
-        return frames  # 16-bit PCM, suitable for Exotel
-
-
+def google_tts_synthesize(text: str) -> bytes:
+    input_text = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="ml-IN",
+        ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+        sample_rate_hertz=8000
+    )
+    response = google_tts_client.synthesize_speech(
+        input=input_text,
+        voice=voice,
+        audio_config=audio_config
+    )
+    with wave.open(io.BytesIO(response.audio_content), "rb") as wav_file:
+        return wav_file.readframes(wav_file.getnframes())
 
 # Configure logging
 logging.basicConfig(
@@ -59,7 +55,7 @@ logger = logging.getLogger("exotel_bot")
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
-google_tts = GoogleTTS()
+
 # Try to import Sarvam AI but make it optional
 try:
     from sarvamai import SarvamAI
@@ -316,7 +312,7 @@ def text_to_pcm(text: str) -> bytes:
         return generate_mock_pcm(text)
 
     try:
-        pcm = google_tts.synthesize(text)
+        pcm = google_tts_synthesize(text)
         logger.debug(f"Generated PCM length: {len(pcm)}")
         return pcm
     except Exception as e:
