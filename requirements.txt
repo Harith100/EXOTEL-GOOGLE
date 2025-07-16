@@ -5,5 +5,7 @@ python-dotenv
 numpy
 groq
 sarvamai
+google-cloud-texttospeech
+
 
 

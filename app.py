@@ -15,14 +15,18 @@ import io
 import struct
 import json
 from datetime import datetime
-
 from google.cloud import texttospeech
+from google.oauth2 import service_account
 
 class GoogleTTS:
     def __init__(self):
-        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
-        self.client = texttospeech.TextToSpeechClient()
+        creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        if not creds_json:
+            raise RuntimeError("❌ Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable")
+
+        creds_dict = json.loads(creds_json)
+        credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        self.client = texttospeech.TextToSpeechClient(credentials=credentials)
 
     def synthesize(self, text: str) -> bytes:
         input_text = texttospeech.SynthesisInput(text=text)
@@ -39,7 +43,8 @@ class GoogleTTS:
         )
         with wave.open(io.BytesIO(response.audio_content), "rb") as wav_file:
             frames = wav_file.readframes(wav_file.getnframes())
-        return frames  # this is raw 16-bit PCM (suitable for Exotel)
+        return frames  # raw 16-bit PCM, 8kHz mono, Exotel-compatible
+
 
 
 # Configure logging
