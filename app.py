@@ -22,8 +22,7 @@ class GoogleTTS:
     def __init__(self):
         creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
         if not creds_json:
-            raise RuntimeError("❌ Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable")
-
+            raise ValueError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON")
         creds_dict = json.loads(creds_json)
         credentials = service_account.Credentials.from_service_account_info(creds_dict)
         self.client = texttospeech.TextToSpeechClient(credentials=credentials)
@@ -32,18 +31,20 @@ class GoogleTTS:
         input_text = texttospeech.SynthesisInput(text=text)
         voice = texttospeech.VoiceSelectionParams(
             language_code="ml-IN",
-            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000
+            sample_rate_hertz=8000,
         )
         response = self.client.synthesize_speech(
-            input=input_text, voice=voice, audio_config=audio_config
+            input=input_text,
+            voice=voice,
+            audio_config=audio_config,
         )
         with wave.open(io.BytesIO(response.audio_content), "rb") as wav_file:
             frames = wav_file.readframes(wav_file.getnframes())
-        return frames  # raw 16-bit PCM, 8kHz mono, Exotel-compatible
+        return frames  # 16-bit PCM, suitable for Exotel
 
 
 
