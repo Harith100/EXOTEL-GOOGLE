@@ -1,8 +1,8 @@
-# AI Voice Assistant for Vythiri Park
+# AI Voice Assistant
 
 ## Overview
 
-An end-to-end conversational voice AI system built to handle inbound phone calls for Vythiri Park, a tourist attraction in Wayanad, Kerala. The system enables callers to speak naturally in Malayalam and receive real-time AI-generated responses through a fully automated voice conversation.
+An end-to-end conversational voice AI system built to handle inbound phone calls. The system enables callers to speak naturally in Malayalam and receive real-time AI-generated responses through a fully automated voice conversation.
 
 The application integrates telephony streaming, speech-to-text, large language models, and text-to-speech into a single real-time pipeline capable of handling live customer interactions.
 
